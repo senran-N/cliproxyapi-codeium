@@ -1,0 +1,9 @@
+/devin-codeium
+/devin-codeium.exe
+*.exe
+*.so
+*.dll
+*.dylib
+/dist/
+/auths/
+config.yaml
