@@ -41,21 +41,11 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 	}
 	meta := metadataForChat(cfg, entry.token)
 
-	seen := map[string]bool{}
-	var out []modelDef
-	for _, method := range []string{"GetCliModelConfigs", "GetCommandModelConfigs"} {
-		raw, err := modelConfigsRPC(ctx, client, cfg, meta, method)
-		if err != nil {
-			continue
-		}
-		for _, m := range parseModelEntries(raw) {
-			if m.Wire == "" || seen[m.Wire] {
-				continue
-			}
-			seen[m.Wire] = true
-			out = append(out, m)
-		}
+	raw, err := modelConfigsRPC(ctx, client, cfg, meta, "GetCliModelConfigs")
+	if err != nil {
+		return nil
 	}
+	out := parseModelEntries(raw)
 	if len(out) == 0 {
 		return nil
 	}
@@ -91,12 +81,16 @@ func modelConfigsRPC(ctx context.Context, client *http.Client, cfg providerConfi
 	return io.ReadAll(resp.Body)
 }
 
-// parseModelEntries extracts model entries from a model-config protobuf
-// response. Each top-level entry carries f1 = display name and f22 = the wire
-// model id (an enum like "MODEL_CLAUDE_4_5_OPUS" for first-party models, or a
-// plain slug like "glm-5-2" / "kimi-k2-7" / "claude-5-fable-medium" for others).
-// The friendly id is derived from the display name; the wire id goes to f21 of
-// GetChatMessage.
+// parseModelEntries extracts the featured (primary) model entries from a
+// model-config protobuf response. Each entry carries f1 = full display name,
+// f22 = wire model id (sent as GetChatMessage f21), f11 = featured flag, and
+// f30.f1 = the base family display name.
+//
+// The backend returns ~150 entries (every model x thinking tier x fast x context
+// variant). We surface only the featured entries (f11=1) — the handful the Devin
+// picker shows by default — named by their clean family name (glm-5.2,
+// claude-opus-4.8, kimi-k2.7, …). Non-featured variants stay callable by passing
+// their exact wire id (e.g. "claude-opus-4-8-high").
 func parseModelEntries(raw []byte) []modelDef {
 	var out []modelDef
 	seen := map[string]bool{}
@@ -109,35 +103,55 @@ func parseModelEntries(raw []byte) []modelDef {
 		if wire != 2 {
 			continue
 		}
-		display, wireID := entryDisplayWire(sub)
-		if display == "" || wireID == "" || seen[wireID] {
+		e := parseModelEntry(sub)
+		if e.wire == "" || e.display == "" || !e.featured {
 			continue
 		}
-		seen[wireID] = true
-		out = append(out, modelDef{ID: slugify(display), Display: display, Wire: wireID})
+		name := e.base
+		if name == "" {
+			name = e.display
+		}
+		id := slugify(name)
+		if id == "" || seen[id] {
+			id = slugify(e.display) // disambiguate collisions (e.g. two SWE variants)
+		}
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, modelDef{ID: id, Display: e.display, Wire: e.wire})
 	}
 	return out
 }
 
-// entryDisplayWire reads f1 (display) and f22 (wire id) from one model entry.
-func entryDisplayWire(b []byte) (display, wire string) {
+type modelEntry struct {
+	display, wire, base string
+	featured            bool
+}
+
+// parseModelEntry reads f1/f22/f11 and the nested f30.f1 base name.
+func parseModelEntry(b []byte) modelEntry {
+	var e modelEntry
 	r := newPR(b)
 	for !r.eof() {
-		f, w, sub, _, err := r.next()
+		f, w, sub, v, err := r.next()
 		if err != nil {
 			break
 		}
-		if w != 2 || !isPrintableText(sub) {
-			continue
-		}
-		switch f {
-		case 1:
-			display = string(sub)
-		case 22:
-			wire = string(sub)
+		switch {
+		case w == 0 && f == 11:
+			e.featured = v == 1
+		case w == 2 && f == 1 && isPrintableText(sub):
+			e.display = string(sub)
+		case w == 2 && f == 22 && isPrintableText(sub):
+			e.wire = string(sub)
+		case w == 2 && f == 30:
+			if base, err := parseFirstStringField(sub, 1); err == nil {
+				e.base = base
+			}
 		}
 	}
-	return
+	return e
 }
 
 func isPrintableText(b []byte) bool {
