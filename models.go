@@ -45,6 +45,9 @@ var codeiumModels = []modelDef{
 // A value that already looks like a wire id (MODEL_*, swe-*) or an unknown id is
 // passed through unchanged, so callers may also send the raw enum directly.
 func resolveModelWire(id string) string {
+	if w, ok := resolveDynamic(id); ok {
+		return w
+	}
 	for _, m := range codeiumModels {
 		if m.ID == id {
 			return m.Wire

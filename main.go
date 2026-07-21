@@ -55,6 +55,19 @@ func init() {
 	)
 }
 
+func toModelInfos(list []modelDef) []*cliproxy.ModelInfo {
+	infos := make([]*cliproxy.ModelInfo, 0, len(list))
+	for _, m := range list {
+		infos = append(infos, &cliproxy.ModelInfo{
+			ID:          m.ID,
+			Object:      "model",
+			Type:        providerKey,
+			DisplayName: m.Display,
+		})
+	}
+	return infos
+}
+
 func hasCodeiumAuth(core *coreauth.Manager) bool {
 	for _, a := range core.List() {
 		if strings.EqualFold(a.Provider, providerKey) {
@@ -79,15 +92,9 @@ func main() {
 
 	hooks := cliproxy.Hooks{
 		OnAfterStart: func(s *cliproxy.Service) {
-			models := make([]*cliproxy.ModelInfo, 0, len(codeiumModels))
-			for _, m := range codeiumModels {
-				models = append(models, &cliproxy.ModelInfo{
-					ID:          m.ID,
-					Object:      "model",
-					Type:        providerKey,
-					DisplayName: m.Display,
-				})
-			}
+			staticInfos := toModelInfos(codeiumModels)
+			// dynamic per-account catalogue, fetched once and cached by auth id.
+			cache := map[string][]*cliproxy.ModelInfo{}
 			// The catalogue must be registered under each codeium auth's own id so
 			// the scheduler considers that auth capable of serving the models
 			// (ClientSupportsModel keys on auth id). The service clears an auth's
@@ -95,17 +102,25 @@ func main() {
 			// so we (re)register periodically to keep the models available.
 			go func() {
 				for {
-					if hasCodeiumAuth(core) {
+					for _, a := range core.List() {
+						if !strings.EqualFold(a.Provider, providerKey) {
+							continue
+						}
 						// The service installs an OpenAI-compat executor for unknown
 						// providers on auth (re)load, clobbering ours; restore it.
 						core.RegisterExecutor(codeiumExecutor{})
-						for _, a := range core.List() {
-							if strings.EqualFold(a.Provider, providerKey) {
-								cliproxy.GlobalModelRegistry().RegisterClient(a.ID, providerKey, models)
+						infos := cache[a.ID]
+						if infos == nil {
+							if dyn := fetchModelCatalog(context.Background(), configFromAuth(a)); len(dyn) > 0 {
+								infos = toModelInfos(dyn)
+								cache[a.ID] = infos // cache only real results; retry otherwise
+							} else {
+								infos = staticInfos
 							}
 						}
+						cliproxy.GlobalModelRegistry().RegisterClient(a.ID, providerKey, infos)
 					}
-					time.Sleep(2 * time.Second)
+					time.Sleep(3 * time.Second)
 				}
 			}()
 		},

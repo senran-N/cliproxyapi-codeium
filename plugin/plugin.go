@@ -161,8 +161,10 @@ func handleMethod(method string, request []byte) (result json.RawMessage, code, 
 		return json.RawMessage(registerJSON()), "", ""
 	case "executor.identifier":
 		return json.RawMessage(`{"identifier":"` + providerKey + `"}`), "", ""
-	case "model.static", "model.for_auth":
-		return json.RawMessage(modelsJSON()), "", ""
+	case "model.static":
+		return json.RawMessage(modelsJSON(codeiumModels)), "", ""
+	case "model.for_auth":
+		return modelsForAuth(request), "", ""
 	case "executor.execute":
 		return runExecute(request, false)
 	case "executor.execute_stream":
@@ -235,10 +237,26 @@ func registerJSON() string {
 	return string(b)
 }
 
-// modelsJSON returns the provider model catalogue for model.static/for_auth.
-func modelsJSON() string {
-	models := make([]map[string]any, 0, len(codeiumModels))
-	for _, m := range codeiumModels {
+// modelsForAuth returns the account's live model catalogue, fetched from the
+// backend using the auth's session token, falling back to the static list.
+func modelsForAuth(request []byte) json.RawMessage {
+	var r struct {
+		Metadata   map[string]any    `json:"Metadata"`
+		Attributes map[string]string `json:"Attributes"`
+	}
+	_ = json.Unmarshal(request, &r)
+	cfg := configFromMaps(r.Attributes, r.Metadata)
+	models := fetchModelCatalog(context.Background(), cfg)
+	if len(models) == 0 {
+		models = codeiumModels
+	}
+	return json.RawMessage(modelsJSON(models))
+}
+
+// modelsJSON renders a model list for model.static/for_auth.
+func modelsJSON(list []modelDef) string {
+	models := make([]map[string]any, 0, len(list))
+	for _, m := range list {
 		models = append(models, map[string]any{
 			"ID":                         m.ID,
 			"Object":                     "model",
