@@ -38,9 +38,11 @@ This repo ships **two forms** of the provider:
    embeds the provider; run it directly (see *Run* below). Best for trying it out
    without the plugin store.
 
-> Status: the standalone form is verified end-to-end (all endpoints, models, and
-> tool calling). The C-ABI plugin reuses the same core and is built by CI; give
-> it a smoke test on your CPA instance before relying on it.
+> Status: **verified end-to-end**. The C-ABI plugin (`plugin/`) was loaded into a
+> real CLIProxyAPI server and served live completions — `/v1/chat/completions`,
+> `/v1/messages` (Anthropic, host-translated), and premium models (Claude Opus
+> 4.5) all returned correctly. Shared libraries are built by CI for
+> linux/amd64, darwin/arm64, and windows/amd64.
 
 ## How it works
 
