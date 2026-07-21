@@ -6,7 +6,7 @@
       "name": "Codeium / Devin (Windsurf) Provider",
       "description": "Serve Devin/Windsurf models (SWE, Claude, GPT, Gemini) via your own account. OpenAI/Anthropic/Responses compatible with tool calling.",
       "author": "senran-N",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "repository": "https://github.com/senran-N/cliproxyapi-codeium",
       "homepage": "https://github.com/senran-N/cliproxyapi-codeium",
       "license": "MIT",
@@ -14,7 +14,11 @@
       "auth_required": true,
       "install": {
         "type": "github-release",
-        "artifacts": []
+        "artifacts": [
+      { "goos": "linux", "goarch": "amd64", "url": "https://github.com/senran-N/cliproxyapi-codeium/releases/download/v0.1.0/cliproxy-codeium-linux-amd64.so", "sha256": "7edb15a3f6bad3322733efc8557885b956a33374f6f41e90cb478ffe419afda0", "size": 9713480 },
+      { "goos": "darwin", "goarch": "arm64", "url": "https://github.com/senran-N/cliproxyapi-codeium/releases/download/v0.1.0/cliproxy-codeium-darwin-arm64.dylib", "sha256": "6bf7db34f7846c112822b4464798e7743d2a95274218c3c04cf734928ef10371", "size": 6362386 },
+      { "goos": "windows", "goarch": "amd64", "url": "https://github.com/senran-N/cliproxyapi-codeium/releases/download/v0.1.0/cliproxy-codeium-windows-amd64.dll", "sha256": "eafdc9b23667f03e3197faab4983cf62bed94ed8bcaac1597927a00fc57c0c39", "size": 12295081 }
+        ]
       }
     }
   ]

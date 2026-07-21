@@ -74,10 +74,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
-          git checkout main
-          cp registry.json /tmp/registry.json
-          git checkout -- . 2>/dev/null || true
-          cp /tmp/registry.json registry.json
+          git checkout -B main origin/main
+          bash scripts/gen-registry.sh "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}" dist
           git add registry.json
           git commit -m "chore: update registry.json for ${GITHUB_REF_NAME}" || echo "no changes"
           git push origin main
