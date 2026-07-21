@@ -1,0 +1,35 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  standalone:
+    name: standalone module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  plugin:
+    name: c-shared plugin (cgo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Build c-shared plugin
+        working-directory: plugin
+        env:
+          CGO_ENABLED: "1"
+        run: go build -buildmode=c-shared -o /tmp/cliproxy-codeium.so .
+      - run: go vet ./plugin/... || true

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codeium",
+      "name": "Codeium / Devin (Windsurf) Provider",
+      "description": "Serve Devin/Windsurf models (SWE, Claude, GPT, Gemini) via your own account. OpenAI/Anthropic/Responses compatible with tool calling.",
+      "author": "senran-N",
+      "version": "0.0.0",
+      "repository": "https://github.com/senran-N/cliproxyapi-codeium",
+      "homepage": "https://github.com/senran-N/cliproxyapi-codeium",
+      "license": "MIT",
+      "tags": ["codeium", "windsurf", "devin", "openai-compatible"],
+      "auth_required": true,
+      "install": {
+        "type": "github-release",
+        "artifacts": []
+      }
+    }
+  ]
+}

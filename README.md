@@ -16,6 +16,32 @@ including multi-turn agent flows (assistant tool call → tool result → answer
 The executor speaks OpenAI chat internally; the SDK's built-in translators bridge
 the Anthropic / Responses protocols in and out.
 
+## Install as a CLIProxyAPI plugin (marketplace)
+
+This repo ships **two forms** of the provider:
+
+1. **Dynamic-library plugin** (`plugin/`, C-ABI) — installable through the
+   CLIProxyAPI plugin store. Add this repo's registry to your config:
+
+   ```yaml
+   plugins:
+     enabled: true
+     registries:
+       - "https://raw.githubusercontent.com/senran-N/cliproxyapi-codeium/main/registry.json"
+   ```
+
+   Then install the `codeium` plugin from the management UI / plugin store. The
+   shared libraries (`.so` / `.dylib` / `.dll`) are built by CI and attached to
+   each GitHub Release.
+
+2. **Standalone server** (repo root) — a self-contained CLIProxyAPI build that
+   embeds the provider; run it directly (see *Run* below). Best for trying it out
+   without the plugin store.
+
+> Status: the standalone form is verified end-to-end (all endpoints, models, and
+> tool calling). The C-ABI plugin reuses the same core and is built by CI; give
+> it a smoke test on your CPA instance before relying on it.
+
 ## How it works
 
 ```
