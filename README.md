@@ -26,9 +26,14 @@ This repo ships **two forms** of the provider:
    ```yaml
    plugins:
      enabled: true
-     registries:
+     store-sources:
        - "https://raw.githubusercontent.com/senran-N/cliproxyapi-codeium/main/registry.json"
    ```
+
+   The `codeium` plugin then appears in the plugin store
+   (`GET /v0/management/plugin-store` / the management panel's Plugin Store),
+   alongside the official plugins. Install it, then add a `codeium` auth file
+   (`{"type":"codeium","session_token":"devin-session-token$…"}`).
 
    Then install the `codeium` plugin from the management UI / plugin store. The
    shared libraries (`.so` / `.dylib` / `.dll`) are built by CI and attached to
