@@ -72,9 +72,21 @@ effort is mapped to the matching variant automatically:
 
 **In OpenAI-style clients:** add `"reasoning_effort": "high"` to the request.
 
-**Context window:** each model defaults to its **largest** available context
-variant (e.g. `glm-5.2` resolves to the 1M-token `glm-5-2-1m`, not the 200K
-base). Pick a smaller/cheaper context by sending that variant's exact wire id.
+**Context window:** the plain family id is the model's **default** (featured)
+context — e.g. `glm-5.2` is the 200K model. When a family also offers a larger
+window, it gets a context-suffixed sibling id you can pick explicitly:
+
+| model id | context | thinking |
+|---|---|---|
+| `glm-5.2` | 200K (default) | via `reasoning_effort` |
+| `glm-5.2-1m` | 1M | via `reasoning_effort` |
+
+> Why an id and not a client setting? A client's context switch — Claude Code's
+> `anthropic-beta: context-1m-*` header, Codex's `model_context_window` — is
+> either an HTTP header or a client-side compaction knob; **neither is forwarded
+> to a CLIProxyAPI provider plugin** (only `reasoning_effort` is). The model id is
+> the one context signal that reaches the plugin and that CPA will route, so
+> context lives there.
 
 Not every family has every tier (e.g. `glm-5.2` only has base + `max`); missing
 tiers fall back to the family default.

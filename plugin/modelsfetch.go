@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -120,10 +121,29 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 		return nil
 	}
 
-	families := map[string]map[string]string{} // family id -> tier -> wire
-	bestCtx := map[string]map[string]uint64{}  // family id -> tier -> best context seen
-	baseName := map[string]string{}            // family id -> base display
-	featuredTier := map[string]string{}        // family id -> featured entry's tier
+	list, baseWire, families := buildCatalog(entries)
+	if len(list) == 0 {
+		return nil
+	}
+	dynCatMu.Lock()
+	dynBaseWire = baseWire
+	dynFamilies = families
+	dynCatMu.Unlock()
+	return list
+}
+
+// buildCatalog turns raw model entries into the client-facing model list plus the
+// resolution tables (family/context key -> default wire, and key -> tier -> wire).
+// Split out from fetchModelCatalog so the bucketing is unit-testable without a
+// live account.
+func buildCatalog(entries []modelEntry) (list []modelDef, baseWire map[string]string, families map[string]map[string]string) {
+	// Pass 1: learn each base family's default (featured) tier + context window.
+	// The featured entry is what the Devin picker shows by default — for GLM that
+	// is the 200K "High", not the 1M variant — so we treat its context as the
+	// family default rather than forcing the largest window.
+	baseName := map[string]string{}     // family slug -> base display
+	featuredTier := map[string]string{} // family slug -> featured entry's tier
+	featuredCtx := map[string]uint64{}  // family slug -> featured entry's context
 	for _, e := range entries {
 		if e.wire == "" {
 			continue
@@ -136,44 +156,79 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 		if fam == "" {
 			continue
 		}
+		if _, ok := baseName[fam]; !ok {
+			baseName[fam] = base
+		}
+		if e.featured {
+			if tier := tierFromDisplay(e.display, base); tier != "" {
+				featuredTier[fam] = tier
+				featuredCtx[fam] = e.context
+			}
+		}
+	}
+
+	// Pass 2: bucket every variant into a model key. Variants at the family's
+	// default context land under the plain family id (e.g. "glm-5.2"); variants
+	// with a *larger* window get a context-suffixed sibling id (e.g.
+	// "glm-5.2-1m"). Within a key, the tier (thinking effort) selects the wire.
+	families = map[string]map[string]string{} // model key -> tier -> wire
+	keyDisplay := map[string]string{}         // model key -> display name
+	keyFam := map[string]string{}             // model key -> base family slug
+	for _, e := range entries {
+		if e.wire == "" {
+			continue
+		}
+		base := e.base
+		if base == "" {
+			base = e.display
+		}
+		fam := slugify(base)
+		if fam == "" {
+			continue
+		}
+		if _, ok := featuredTier[fam]; !ok {
+			continue // only surface families the picker features
+		}
 		tier := tierFromDisplay(e.display, base)
 		if tier == "" {
 			continue // skip fast/priority speed variants
 		}
-		if families[fam] == nil {
-			families[fam] = map[string]string{}
-			bestCtx[fam] = map[string]uint64{}
-			baseName[fam] = base
+		defCtx := featuredCtx[fam]
+		key := fam
+		display := baseName[fam]
+		if defCtx > 0 && e.context > defCtx {
+			label := ctxLabel(e.context)
+			key = fam + "-" + label
+			display = baseName[fam] + " (" + label + " context)"
+		} else if defCtx > 0 && e.context < defCtx {
+			continue // smaller-than-default windows are not surfaced
 		}
-		// Prefer the largest-context variant for each tier (default = max context).
-		if cur, ok := families[fam][tier]; !ok || e.context >= bestCtx[fam][tier] {
-			_ = cur
-			bestCtx[fam][tier] = e.context
-			families[fam][tier] = e.wire
+		if families[key] == nil {
+			families[key] = map[string]string{}
+			keyDisplay[key] = display
+			keyFam[key] = fam
 		}
-		if e.featured {
-			featuredTier[fam] = tier
+		if _, ok := families[key][tier]; !ok {
+			families[key][tier] = e.wire
 		}
 	}
 
-	baseWire := map[string]string{}
-	var list []modelDef
-	for fam, ft := range featuredTier {
-		wire := families[fam][ft]
+	baseWire = map[string]string{}
+	for key, tiers := range families {
+		wire := tiers[featuredTier[keyFam[key]]]
+		if wire == "" {
+			for _, w := range tiers {
+				wire = w
+				break
+			}
+		}
 		if wire == "" {
 			continue
 		}
-		baseWire[fam] = wire
-		list = append(list, modelDef{ID: fam, Display: baseName[fam], Wire: wire})
+		baseWire[key] = wire
+		list = append(list, modelDef{ID: key, Display: keyDisplay[key], Wire: wire})
 	}
-	if len(list) == 0 {
-		return nil
-	}
-	dynCatMu.Lock()
-	dynBaseWire = baseWire
-	dynFamilies = families
-	dynCatMu.Unlock()
-	return list
+	return list, baseWire, families
 }
 
 func modelConfigsRPC(ctx context.Context, client *http.Client, cfg providerConfig, meta []byte, method string) ([]byte, error) {
@@ -204,11 +259,11 @@ func modelConfigsRPC(ctx context.Context, client *http.Client, cfg providerConfi
 // f30.f1 = the base family display name.
 //
 // The backend returns ~150 entries (every model x thinking tier x fast x context
-// variant). We surface the featured entries (f11=1) collapsed down to ONE entry
-// per base model family (f30.f1) — the ~10 clean names the Devin picker shows by
-// default (claude-opus-4.8, gpt-5.6-sol, glm-5.2, …). The extra thinking/
-// context variants of a family are dropped from the list but stay callable by
-// passing their exact wire id (e.g. "claude-opus-4-8-high").
+// variant). We surface the featured families (f11=1) as clean base ids
+// (claude-opus-4.8, gpt-5.6-sol, glm-5.2, …) at their default context, plus one
+// context-suffixed sibling per family that offers a larger window (e.g.
+// glm-5.2-1m). The thinking tier is chosen at request time from reasoning_effort,
+// so the picker stays small while every context/effort combination is reachable.
 func parseModelEntries(raw []byte) []modelEntry {
 	var out []modelEntry
 	r := newPR(raw)
@@ -273,6 +328,19 @@ func isPrintableText(b []byte) bool {
 		}
 	}
 	return float64(printable)/float64(len(b)) > 0.9
+}
+
+// ctxLabel renders a context-window length as a short id suffix: 200000 -> "200k",
+// 1048576 -> "1m". Used to name the larger-context sibling of a base family.
+func ctxLabel(n uint64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%dm", (n+500_000)/1_000_000)
+	case n >= 1000:
+		return fmt.Sprintf("%dk", (n+500)/1000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 // slugify turns a display name into a friendly model id, e.g.
