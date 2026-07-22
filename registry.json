@@ -10,7 +10,12 @@
       "repository": "https://github.com/senran-N/cliproxyapi-codeium",
       "homepage": "https://github.com/senran-N/cliproxyapi-codeium",
       "license": "MIT",
-      "tags": ["codeium", "windsurf", "devin", "openai-compatible"],
+      "tags": [
+        "codeium",
+        "windsurf",
+        "devin",
+        "openai-compatible"
+      ],
       "auth_required": true
     }
   ]
