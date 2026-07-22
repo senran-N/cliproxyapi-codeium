@@ -49,6 +49,33 @@ This repo ships **two forms** of the provider:
 > 4.5) all returned correctly. Shared libraries are built by CI for
 > linux/amd64, darwin/arm64, and windows/amd64.
 
+## Models & thinking variants
+
+`/v1/models` lists the ~10 **base model families** the Devin picker shows
+(`claude-opus-4.8`, `claude-fable-5`, `claude-sonnet-5`, `gpt-5.6-sol`,
+`gpt-5.6-luna`, `glm-5.2`, `kimi-k2.7`, `swe-1.7`, `adaptive`, …), fetched live
+from your account. The backend also exposes ~150 thinking/context **variants** of
+those families (Low / Medium / High / XHigh / Max, Fast, 1M-context); the plugin
+selects the right variant from the request's **reasoning effort** instead of
+cluttering the model list.
+
+**In Claude Code:** pick a base model (e.g. `claude-opus-4.8`) and use its
+thinking control (think / think hard / ultrathink, or a thinking budget). The
+effort is mapped to the matching variant automatically:
+
+| reasoning effort | example wire model |
+|---|---|
+| *(none / default)* | `claude-opus-4-8-medium` |
+| `low` | `claude-opus-4-8-low` |
+| `high` | `claude-opus-4-8-high` |
+| `xhigh` | `claude-opus-4-8-xhigh` |
+| `max` | `claude-opus-4-8-max` |
+
+**In OpenAI-style clients:** add `"reasoning_effort": "high"` to the request.
+
+Not every family has every tier (e.g. `glm-5.2` only has base + `max`); missing
+tiers fall back to the family default.
+
 ## How it works
 
 ```
