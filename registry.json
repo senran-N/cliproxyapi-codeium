@@ -6,7 +6,7 @@
       "name": "Codeium / Devin (Windsurf) Provider",
       "description": "Serve Devin/Windsurf models (Claude, GPT, GLM, Kimi, Gemini, SWE) via your own account. OpenAI/Anthropic/Responses compatible with tool calling and reasoning-effort variants.",
       "author": "senran-N",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "repository": "https://github.com/senran-N/cliproxyapi-codeium",
       "homepage": "https://github.com/senran-N/cliproxyapi-codeium",
       "license": "MIT",
