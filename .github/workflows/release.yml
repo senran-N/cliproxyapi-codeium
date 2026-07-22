@@ -16,24 +16,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            ext: so
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
-            ext: dylib
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
-            ext: dll
+          - { os: ubuntu-latest, goos: linux, goarch: amd64, ext: so }
+          - { os: macos-latest, goos: darwin, goarch: arm64, ext: dylib }
+          - { os: windows-latest, goos: windows, goarch: amd64, ext: dll }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - name: Build c-shared plugin
+      - name: Build + package
         working-directory: plugin
         shell: bash
         env:
@@ -41,18 +32,24 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          mkdir -p ../dist
-          out="../dist/cliproxy-codeium-${GOOS}-${GOARCH}.${{ matrix.ext }}"
-          go build -buildmode=c-shared -o "$out" .
-          ls -la ../dist
+          ver="${GITHUB_REF_NAME#v}"
+          [ -n "$ver" ] || ver="0.0.0"
+          lib="codeium.${{ matrix.ext }}"
+          go build -buildmode=c-shared -o "$lib" .
+          rm -f codeium.h
+          zip="codeium_${ver}_${GOOS}_${GOARCH}.zip"
+          # Plugin-store convention: the dynamic library must sit at the zip root,
+          # named "<id>.<ext>". Use Python so packaging is identical on every runner.
+          python -c "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],'w',zipfile.ZIP_DEFLATED); z.write(sys.argv[2], arcname=sys.argv[2]); z.close()" "../$zip" "$lib"
+          ls -la "../$zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: plugin-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*.${{ matrix.ext }}
+          name: zip-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "*.zip"
           if-no-files-found: error
 
   release:
-    name: release + registry
+    name: release
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
@@ -62,20 +59,27 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Generate registry.json
-        run: bash scripts/gen-registry.sh "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}" dist
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-      - name: Commit registry.json to main
+      - name: checksums
+        run: (cd dist && sha256sum *.zip > checksums.txt && cat checksums.txt)
+      - name: Sync registry.json version on main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git checkout -B main origin/main
-          bash scripts/gen-registry.sh "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}" dist
+          python - "${GITHUB_REF_NAME#v}" <<'PY'
+          import json, sys
+          d = json.load(open("registry.json"))
+          d["plugins"][0]["version"] = sys.argv[1]
+          json.dump(d, open("registry.json", "w"), indent=2)
+          PY
           git add registry.json
-          git commit -m "chore: update registry.json for ${GITHUB_REF_NAME}" || echo "no changes"
+          git commit -m "chore: registry.json version ${GITHUB_REF_NAME#v}" || echo "no change"
           git push origin main
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
