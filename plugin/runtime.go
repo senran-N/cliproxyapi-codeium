@@ -11,7 +11,7 @@ import (
 // pluginName/Version/Author are surfaced to management clients and the registry.
 const (
 	pluginName    = "codeium"
-	pluginVersion = "0.2.0"
+	pluginVersion = "0.3.0"
 	pluginAuthor  = "senran-N"
 	pluginRepo    = "https://github.com/senran-N/cliproxyapi-codeium"
 )
