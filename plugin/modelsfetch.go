@@ -206,7 +206,7 @@ func modelConfigsRPC(ctx context.Context, client *http.Client, cfg providerConfi
 // The backend returns ~150 entries (every model x thinking tier x fast x context
 // variant). We surface the featured entries (f11=1) collapsed down to ONE entry
 // per base model family (f30.f1) — the ~10 clean names the Devin picker shows by
-// default (claude-opus-4.5, gpt-5.2, gemini-3-flash, …). The extra thinking/
+// default (claude-opus-4.8, gpt-5.6-sol, glm-5.2, …). The extra thinking/
 // context variants of a family are dropped from the list but stay callable by
 // passing their exact wire id (e.g. "claude-opus-4-8-high").
 func parseModelEntries(raw []byte) []modelEntry {
@@ -276,7 +276,7 @@ func isPrintableText(b []byte) bool {
 }
 
 // slugify turns a display name into a friendly model id, e.g.
-// "Claude Opus 4.5 Thinking" -> "claude-opus-4.5-thinking".
+// "Claude Opus 4.8 High" -> "claude-opus-4.8-high".
 func slugify(display string) string {
 	var b strings.Builder
 	prevDash := false
