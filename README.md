@@ -73,6 +73,10 @@ effort is mapped to the matching variant automatically:
 
 **In OpenAI-style clients:** add `"reasoning_effort": "high"` to the request.
 
+**Context window:** each model defaults to its **largest** available context
+variant (e.g. `glm-5.2` resolves to the 1M-token `glm-5-2-1m`, not the 200K
+base). Pick a smaller/cheaper context by sending that variant's exact wire id.
+
 Not every family has every tier (e.g. `glm-5.2` only has base + `max`); missing
 tiers fall back to the family default.
 

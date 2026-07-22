@@ -121,9 +121,9 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 	}
 
 	families := map[string]map[string]string{} // family id -> tier -> wire
-	baseWire := map[string]string{}            // family id -> featured wire
-	var list []modelDef
-	seenList := map[string]bool{}
+	bestCtx := map[string]map[string]uint64{}  // family id -> tier -> best context seen
+	baseName := map[string]string{}            // family id -> base display
+	featuredTier := map[string]string{}        // family id -> featured entry's tier
 	for _, e := range entries {
 		if e.wire == "" {
 			continue
@@ -136,25 +136,35 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 		if fam == "" {
 			continue
 		}
-		// Record the variant under its reasoning-effort tier.
-		if tier := tierFromDisplay(e.display, base); tier != "" {
-			if families[fam] == nil {
-				families[fam] = map[string]string{}
-			}
-			if _, exists := families[fam][tier]; !exists {
-				families[fam][tier] = e.wire // first (non-fast) variant wins
-			}
+		tier := tierFromDisplay(e.display, base)
+		if tier == "" {
+			continue // skip fast/priority speed variants
 		}
-		// The featured entry defines the family's default wire + list presence.
+		if families[fam] == nil {
+			families[fam] = map[string]string{}
+			bestCtx[fam] = map[string]uint64{}
+			baseName[fam] = base
+		}
+		// Prefer the largest-context variant for each tier (default = max context).
+		if cur, ok := families[fam][tier]; !ok || e.context >= bestCtx[fam][tier] {
+			_ = cur
+			bestCtx[fam][tier] = e.context
+			families[fam][tier] = e.wire
+		}
 		if e.featured {
-			if _, ok := baseWire[fam]; !ok {
-				baseWire[fam] = e.wire
-			}
-			if !seenList[fam] {
-				seenList[fam] = true
-				list = append(list, modelDef{ID: fam, Display: base, Wire: e.wire})
-			}
+			featuredTier[fam] = tier
 		}
+	}
+
+	baseWire := map[string]string{}
+	var list []modelDef
+	for fam, ft := range featuredTier {
+		wire := families[fam][ft]
+		if wire == "" {
+			continue
+		}
+		baseWire[fam] = wire
+		list = append(list, modelDef{ID: fam, Display: baseName[fam], Wire: wire})
 	}
 	if len(list) == 0 {
 		return nil
@@ -222,9 +232,10 @@ func parseModelEntries(raw []byte) []modelEntry {
 type modelEntry struct {
 	display, wire, base string
 	featured            bool
+	context             uint64 // f18 = context window length
 }
 
-// parseModelEntry reads f1/f22/f11 and the nested f30.f1 base name.
+// parseModelEntry reads f1/f22/f11/f18 and the nested f30.f1 base name.
 func parseModelEntry(b []byte) modelEntry {
 	var e modelEntry
 	r := newPR(b)
@@ -236,6 +247,8 @@ func parseModelEntry(b []byte) modelEntry {
 		switch {
 		case w == 0 && f == 11:
 			e.featured = v == 1
+		case w == 0 && f == 18:
+			e.context = v
 		case w == 2 && f == 1 && isPrintableText(sub):
 			e.display = string(sub)
 		case w == 2 && f == 22 && isPrintableText(sub):
