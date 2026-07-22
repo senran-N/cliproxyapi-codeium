@@ -2,7 +2,7 @@
 
 Exposes the Codeium **`GetChatMessage`** backend (the engine behind Devin / the
 Windsurf editor) as a standard provider. Log in with your own account and call
-any Devin model — `swe-1-7`, `claude-opus-4.5`, `gpt-5.2`, `gemini-3-flash`, … —
+any Devin model — `swe-1.7`, `claude-opus-4.8`, `gpt-5.6-sol`, `glm-5.2`, `kimi-k2.7`, … —
 through all three CLIProxyAPI protocols:
 
 | Endpoint | Protocol | Status |
@@ -45,8 +45,7 @@ This repo ships **two forms** of the provider:
 
 > Status: **verified end-to-end**. The C-ABI plugin (`plugin/`) was loaded into a
 > real CLIProxyAPI server and served live completions — `/v1/chat/completions`,
-> `/v1/messages` (Anthropic, host-translated), and premium models (Claude Opus
-> 4.5) all returned correctly. Shared libraries are built by CI for
+> `/v1/messages` (Anthropic, host-translated), and premium models (Claude Opus 4.8) all returned correctly. Shared libraries are built by CI for
 > linux/amd64, darwin/arm64, and windows/amd64.
 
 ## Models & thinking variants
@@ -156,7 +155,7 @@ curl http://localhost:8317/v1/chat/completions \
   -H "Authorization: Bearer sk-local-devin-proxy" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-5",
+    "model": "claude-opus-4.8",
     "stream": true,
     "messages": [{"role":"user","content":"write quicksort in go"}]
   }'
@@ -193,22 +192,12 @@ content:   "pong"
   `failed_precondition: please update your editor`. Refresh the blob if you bump
   `ext_version` to a build with a different capability set.
 
-### Models (friendly id → upstream enum)
+### Models
 
-| Friendly id | Upstream `f21` |
-|---|---|
-| `swe-1-7`, `swe-1-6` | `swe-1-7` / `swe-1-6` |
-| `claude-opus-4.5` | `MODEL_CLAUDE_4_5_OPUS` |
-| `claude-opus-4.5-thinking` | `MODEL_CLAUDE_4_5_OPUS_THINKING` |
-| `claude-sonnet-4.5` | `MODEL_PRIVATE_2` |
-| `claude-sonnet-4.5-thinking` | `MODEL_PRIVATE_3` |
-| `claude-haiku-4.5` | `MODEL_PRIVATE_11` |
-| `gpt-5.2` / `-none/-low/-high/-xhigh` | `MODEL_GPT_5_2_MEDIUM` / … |
-| `gemini-3-flash` / `-minimal/-low/-high` | `MODEL_GOOGLE_GEMINI_3_0_FLASH_*` |
-| `gemini-2.5-flash` | `MODEL_GOOGLE_GEMINI_2_5_FLASH` |
-
-Enum ids are read from the client's `GetCliModelConfigs` / `GetCommandModelConfigs`
-catalogs and change over time — refresh `models.go` if the roster changes.
+The model catalogue is fetched **live** from your account at runtime (see
+*Models & thinking variants* above) — no model names are hardcoded, so the list
+always reflects what your account currently offers. Only the stable `swe-1-7` /
+`swe-1-6` ids are kept as a fallback if the fetch fails.
 
 To reproduce the live check:
 
