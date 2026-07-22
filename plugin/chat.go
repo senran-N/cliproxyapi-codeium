@@ -18,10 +18,11 @@ const (
 // ---- OpenAI request shapes (subset we consume) ----
 
 type oaiRequest struct {
-	Model    string       `json:"model"`
-	Messages []oaiMessage `json:"messages"`
-	Tools    []oaiTool    `json:"tools"`
-	Stream   bool         `json:"stream"`
+	Model           string       `json:"model"`
+	Messages        []oaiMessage `json:"messages"`
+	Tools           []oaiTool    `json:"tools"`
+	Stream          bool         `json:"stream"`
+	ReasoningEffort string       `json:"reasoning_effort"`
 }
 
 type oaiMessage struct {
@@ -151,8 +152,8 @@ func buildChatRequest(cfg providerConfig, jwt string, oai oaiRequest) ([]byte, s
 
 	req.str(16, uuid.NewString()) // turn id
 	req.varintAlways(20, 1)
-	req.str(21, resolveModelWire(model)) // model selector (friendly id -> MODEL_* enum)
-	req.str(22, uuid.NewString())        // conversation id
+	req.str(21, resolveModelWire(model, oai.ReasoningEffort)) // friendly id (+ effort) -> wire id
+	req.str(22, uuid.NewString())                             // conversation id
 	return req.bytes(), model
 }
 

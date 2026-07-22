@@ -9,19 +9,89 @@ import (
 	"sync"
 )
 
-// dynamicCatalog caches the account's real model list (friendly id -> wire enum),
-// fetched from the backend. It persists for the lifetime of the loaded library.
+// The fetched catalogue, keyed by friendly base-family id (e.g. "claude-opus-4.8").
+// dynBaseWire is the featured/default wire id; dynFamilies maps a reasoning-effort
+// tier (low/medium/high/xhigh/max/none/minimal) to the matching variant wire id.
+// Persist for the lifetime of the loaded library.
 var (
-	dynCatMu   sync.RWMutex
-	dynCatalog map[string]string // friendly id -> wire enum
+	dynCatMu    sync.RWMutex
+	dynBaseWire map[string]string            // family id -> default wire id
+	dynFamilies map[string]map[string]string // family id -> tier -> wire id
 )
 
-// resolveDynamic maps a friendly id to its wire enum using the fetched catalog.
-func resolveDynamic(id string) (string, bool) {
+// resolveDynamic maps a friendly id + reasoning effort to a wire id. It composes
+// a thinking/context variant when the request asks for one (e.g.
+// "claude-opus-4.8" + effort "high" -> "claude-opus-4-8-high").
+func resolveDynamic(id, effort string) (string, bool) {
 	dynCatMu.RLock()
 	defer dynCatMu.RUnlock()
-	w, ok := dynCatalog[id]
-	return w, ok
+	fam, ok := dynFamilies[id]
+	if !ok {
+		w, okBase := dynBaseWire[id]
+		return w, okBase
+	}
+	if tier := normalizeEffort(effort); tier != "" {
+		if w, okTier := fam[tier]; okTier {
+			return w, true
+		}
+	}
+	if w, okBase := dynBaseWire[id]; okBase {
+		return w, true
+	}
+	return "", false
+}
+
+// normalizeEffort maps an OpenAI reasoning_effort / thinking level to a tier key.
+func normalizeEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal":
+		return "minimal"
+	case "low":
+		return "low"
+	case "medium", "auto", "default":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh", "x-high", "very-high", "veryhigh":
+		return "xhigh"
+	case "max", "maximum":
+		return "max"
+	case "none", "off", "no", "disabled":
+		return "none"
+	default:
+		return ""
+	}
+}
+
+// tierFromDisplay extracts a tier key from a variant display name given its base
+// family name, e.g. base "GPT-5.6 Sol", display "GPT-5.6 Sol High Thinking" -> "high".
+// "Fast"/priority speed variants are ignored (returns "").
+func tierFromDisplay(display, base string) string {
+	suffix := strings.TrimSpace(strings.TrimPrefix(display, base))
+	low := strings.ToLower(suffix)
+	if strings.Contains(low, "fast") || strings.Contains(low, "priority") {
+		return ""
+	}
+	switch {
+	case low == "":
+		return "medium"
+	case strings.Contains(low, "no thinking"), low == "none":
+		return "none"
+	case strings.Contains(low, "minimal"):
+		return "minimal"
+	case strings.Contains(low, "x-high"), strings.Contains(low, "xhigh"):
+		return "xhigh"
+	case strings.Contains(low, "high"):
+		return "high"
+	case strings.Contains(low, "medium"):
+		return "medium"
+	case strings.Contains(low, "low"):
+		return "low"
+	case strings.Contains(low, "max"):
+		return "max"
+	default:
+		return ""
+	}
 }
 
 // fetchModelCatalog queries the backend for the account's full model catalogue
@@ -45,18 +115,55 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 	if err != nil {
 		return nil
 	}
-	out := parseModelEntries(raw)
-	if len(out) == 0 {
+	entries := parseModelEntries(raw)
+	if len(entries) == 0 {
 		return nil
 	}
-	cat := make(map[string]string, len(out))
-	for _, m := range out {
-		cat[m.ID] = m.Wire
+
+	families := map[string]map[string]string{} // family id -> tier -> wire
+	baseWire := map[string]string{}            // family id -> featured wire
+	var list []modelDef
+	seenList := map[string]bool{}
+	for _, e := range entries {
+		if e.wire == "" {
+			continue
+		}
+		base := e.base
+		if base == "" {
+			base = e.display
+		}
+		fam := slugify(base)
+		if fam == "" {
+			continue
+		}
+		// Record the variant under its reasoning-effort tier.
+		if tier := tierFromDisplay(e.display, base); tier != "" {
+			if families[fam] == nil {
+				families[fam] = map[string]string{}
+			}
+			if _, exists := families[fam][tier]; !exists {
+				families[fam][tier] = e.wire // first (non-fast) variant wins
+			}
+		}
+		// The featured entry defines the family's default wire + list presence.
+		if e.featured {
+			if _, ok := baseWire[fam]; !ok {
+				baseWire[fam] = e.wire
+			}
+			if !seenList[fam] {
+				seenList[fam] = true
+				list = append(list, modelDef{ID: fam, Display: base, Wire: e.wire})
+			}
+		}
+	}
+	if len(list) == 0 {
+		return nil
 	}
 	dynCatMu.Lock()
-	dynCatalog = cat
+	dynBaseWire = baseWire
+	dynFamilies = families
 	dynCatMu.Unlock()
-	return out
+	return list
 }
 
 func modelConfigsRPC(ctx context.Context, client *http.Client, cfg providerConfig, meta []byte, method string) ([]byte, error) {
@@ -87,13 +194,13 @@ func modelConfigsRPC(ctx context.Context, client *http.Client, cfg providerConfi
 // f30.f1 = the base family display name.
 //
 // The backend returns ~150 entries (every model x thinking tier x fast x context
-// variant). We surface only the featured entries (f11=1) — the handful the Devin
-// picker shows by default — named by their clean family name (glm-5.2,
-// claude-opus-4.8, kimi-k2.7, …). Non-featured variants stay callable by passing
-// their exact wire id (e.g. "claude-opus-4-8-high").
-func parseModelEntries(raw []byte) []modelDef {
-	var out []modelDef
-	seen := map[string]bool{}
+// variant). We surface the featured entries (f11=1) collapsed down to ONE entry
+// per base model family (f30.f1) — the ~10 clean names the Devin picker shows by
+// default (claude-opus-4.5, gpt-5.2, gemini-3-flash, …). The extra thinking/
+// context variants of a family are dropped from the list but stay callable by
+// passing their exact wire id (e.g. "claude-opus-4-8-high").
+func parseModelEntries(raw []byte) []modelEntry {
+	var out []modelEntry
 	r := newPR(raw)
 	for !r.eof() {
 		_, wire, sub, _, err := r.next()
@@ -104,22 +211,10 @@ func parseModelEntries(raw []byte) []modelDef {
 			continue
 		}
 		e := parseModelEntry(sub)
-		if e.wire == "" || e.display == "" || !e.featured {
+		if e.wire == "" || e.display == "" {
 			continue
 		}
-		name := e.base
-		if name == "" {
-			name = e.display
-		}
-		id := slugify(name)
-		if id == "" || seen[id] {
-			id = slugify(e.display) // disambiguate collisions (e.g. two SWE variants)
-		}
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, modelDef{ID: id, Display: e.display, Wire: e.wire})
+		out = append(out, e)
 	}
 	return out
 }

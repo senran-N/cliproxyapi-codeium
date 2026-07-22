@@ -28,6 +28,12 @@ func TestFetchModelCatalogLive(t *testing.T) {
 	for _, m := range models {
 		fmt.Printf("  %-34s -> %s\n", m.ID, m.Wire)
 	}
+	fmt.Println("----- variant composition (base + effort) -----")
+	for _, id := range []string{"claude-opus-4.8", "gpt-5.6-sol", "glm-5.2"} {
+		for _, eff := range []string{"", "low", "high", "xhigh", "max"} {
+			fmt.Printf("  %-16s effort=%-6s -> %s\n", id, eff, resolveModelWire(id, eff))
+		}
+	}
 	fmt.Println("=============================")
 
 	// Verify f22 is the correct GetChatMessage wire id by executing an arena model.

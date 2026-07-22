@@ -86,6 +86,7 @@ type executorRequest struct {
 	Payload         []byte
 	OriginalRequest []byte
 	SourceFormat    string
+	Metadata        map[string]any
 	AuthMetadata    map[string]any
 	AuthAttributes  map[string]string
 }
@@ -194,6 +195,13 @@ func runExecute(request []byte, stream bool) (json.RawMessage, string, string) {
 	}
 	if oai.Model == "" {
 		oai.Model = er.Model
+	}
+	// Reasoning effort (used to compose thinking variants) may come in the payload
+	// or in the host execution metadata.
+	if oai.ReasoningEffort == "" {
+		if v, ok := er.Metadata["reasoning_effort"].(string); ok {
+			oai.ReasoningEffort = v
+		}
 	}
 	ctx := context.Background()
 	if !stream {

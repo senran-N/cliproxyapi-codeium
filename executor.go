@@ -235,6 +235,13 @@ func (e codeiumExecutor) upstream(ctx context.Context, a *coreauth.Auth, cfg pro
 	if err := json.Unmarshal(payload, &oai); err != nil {
 		return nil, fmt.Errorf("codeium: invalid request payload: %w", err)
 	}
+	// The client's reasoning effort (used to compose thinking variants) may arrive
+	// in the payload or in the host's execution metadata.
+	if oai.ReasoningEffort == "" {
+		if v, ok := opts.Metadata[clipexec.ReasoningEffortMetadataKey].(string); ok {
+			oai.ReasoningEffort = v
+		}
+	}
 	client := buildHTTPClient(a)
 	entry, err := getValidJWT(ctx, client, cfg)
 	if err != nil {
