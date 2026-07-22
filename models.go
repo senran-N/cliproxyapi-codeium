@@ -25,8 +25,8 @@ var codeiumModels = []modelDef{
 // resolveModelWire maps a client model id (+ requested reasoning effort) to the
 // upstream wire id. A base family id composes the matching thinking/context
 // variant; an exact wire id passes through unchanged.
-func resolveModelWire(id, effort string) string {
-	if w, ok := resolveDynamic(id, effort); ok {
+func resolveModelWire(accountKey, id, effort string) string {
+	if w, ok := resolveDynamic(accountKey, id, effort); ok {
 		return w
 	}
 	for _, m := range codeiumModels {

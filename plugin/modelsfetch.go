@@ -6,29 +6,37 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 )
 
-// The fetched catalogue, keyed by friendly base-family id (e.g. "claude-opus-4.8").
-// dynBaseWire is the featured/default wire id; dynFamilies maps a reasoning-effort
-// tier (low/medium/high/xhigh/max/none/minimal) to the matching variant wire id.
-// Persist for the lifetime of the loaded library.
+// dynamicCatalog contains one account's friendly-model resolution tables.
+// Accounts can expose different models or map the same friendly id to different
+// wire variants, so catalogues must never be shared across credentials.
+type dynamicCatalog struct {
+	baseWire map[string]string
+	families map[string]map[string]string
+}
+
 var (
-	dynCatMu    sync.RWMutex
-	dynBaseWire map[string]string            // family id -> default wire id
-	dynFamilies map[string]map[string]string // family id -> tier -> wire id
+	dynamicCatalogsMu sync.RWMutex
+	dynamicCatalogs   = map[string]dynamicCatalog{}
 )
 
 // resolveDynamic maps a friendly id + reasoning effort to a wire id. It composes
 // a thinking/context variant when the request asks for one (e.g.
 // "claude-opus-4.8" + effort "high" -> "claude-opus-4-8-high").
-func resolveDynamic(id, effort string) (string, bool) {
-	dynCatMu.RLock()
-	defer dynCatMu.RUnlock()
-	fam, ok := dynFamilies[id]
+func resolveDynamic(accountKey, id, effort string) (string, bool) {
+	dynamicCatalogsMu.RLock()
+	defer dynamicCatalogsMu.RUnlock()
+	catalog, catalogExists := dynamicCatalogs[accountKey]
+	if !catalogExists {
+		return "", false
+	}
+	fam, ok := catalog.families[id]
 	if !ok {
-		w, okBase := dynBaseWire[id]
+		w, okBase := catalog.baseWire[id]
 		return w, okBase
 	}
 	if tier := normalizeEffort(effort); tier != "" {
@@ -36,10 +44,16 @@ func resolveDynamic(id, effort string) (string, bool) {
 			return w, true
 		}
 	}
-	if w, okBase := dynBaseWire[id]; okBase {
+	if w, okBase := catalog.baseWire[id]; okBase {
 		return w, true
 	}
 	return "", false
+}
+
+func storeDynamicCatalog(accountKey string, baseWire map[string]string, families map[string]map[string]string) {
+	dynamicCatalogsMu.Lock()
+	dynamicCatalogs[accountKey] = dynamicCatalog{baseWire: baseWire, families: families}
+	dynamicCatalogsMu.Unlock()
 }
 
 // normalizeEffort maps an OpenAI reasoning_effort / thinking level to a tier key.
@@ -99,7 +113,13 @@ func tierFromDisplay(display, base string) string {
 // (chat + command model configs) and returns friendly model definitions. On any
 // error it returns nil so callers fall back to the static list.
 func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
-	client := http.DefaultClient
+	return fetchModelCatalogWithClient(ctx, http.DefaultClient, cfg)
+}
+
+func fetchModelCatalogWithClient(ctx context.Context, client *http.Client, cfg providerConfig) []modelDef {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	entry, err := getValidJWT(ctx, client, cfg)
 	if err != nil {
 		return nil
@@ -125,10 +145,7 @@ func fetchModelCatalog(ctx context.Context, cfg providerConfig) []modelDef {
 	if len(list) == 0 {
 		return nil
 	}
-	dynCatMu.Lock()
-	dynBaseWire = baseWire
-	dynFamilies = families
-	dynCatMu.Unlock()
+	storeDynamicCatalog(cfg.sessionToken, baseWire, families)
 	return list
 }
 
@@ -228,6 +245,9 @@ func buildCatalog(entries []modelEntry) (list []modelDef, baseWire map[string]st
 		baseWire[key] = wire
 		list = append(list, modelDef{ID: key, Display: keyDisplay[key], Wire: wire})
 	}
+	sort.Slice(list, func(firstIndex, secondIndex int) bool {
+		return list[firstIndex].ID < list[secondIndex].ID
+	})
 	return list, baseWire, families
 }
 

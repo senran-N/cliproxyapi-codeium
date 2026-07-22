@@ -7,7 +7,7 @@ import "testing"
 // backend expects. Uses only synthetic values (no real credentials).
 //
 // End-to-end wire compatibility with the live backend is covered by
-// TestSmokeLive (guarded by CODEIUM_SESSION_TOKEN).
+// TestFetchModelCatalogLive (guarded by CODEIUM_SESSION_TOKEN).
 func TestGetUserJwtRequestRoundTrip(t *testing.T) {
 	cfg := providerConfig{
 		clientName:   "windsurf",

@@ -94,7 +94,11 @@ func main() {
 		OnAfterStart: func(s *cliproxy.Service) {
 			staticInfos := toModelInfos(codeiumModels)
 			// dynamic per-account catalogue, fetched once and cached by auth id.
-			cache := map[string][]*cliproxy.ModelInfo{}
+			type modelCacheEntry struct {
+				sessionToken string
+				models       []*cliproxy.ModelInfo
+			}
+			cache := map[string]modelCacheEntry{}
 			// The catalogue must be registered under each codeium auth's own id so
 			// the scheduler considers that auth capable of serving the models
 			// (ClientSupportsModel keys on auth id). The service clears an auth's
@@ -109,11 +113,16 @@ func main() {
 						// The service installs an OpenAI-compat executor for unknown
 						// providers on auth (re)load, clobbering ours; restore it.
 						core.RegisterExecutor(codeiumExecutor{})
-						infos := cache[a.ID]
-						if infos == nil {
-							if dyn := fetchModelCatalog(context.Background(), configFromAuth(a)); len(dyn) > 0 {
-								infos = toModelInfos(dyn)
-								cache[a.ID] = infos // cache only real results; retry otherwise
+						providerConfig := configFromAuth(a)
+						cachedEntry, cacheExists := cache[a.ID]
+						infos := cachedEntry.models
+						if !cacheExists || cachedEntry.sessionToken != providerConfig.sessionToken {
+							fetchContext, cancelModelFetch := context.WithTimeout(context.Background(), 30*time.Second)
+							dynamicModels := fetchModelCatalogWithClient(fetchContext, buildHTTPClient(a), providerConfig)
+							cancelModelFetch()
+							if len(dynamicModels) > 0 {
+								infos = toModelInfos(dynamicModels)
+								cache[a.ID] = modelCacheEntry{sessionToken: providerConfig.sessionToken, models: infos}
 							} else {
 								infos = staticInfos
 							}

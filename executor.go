@@ -79,6 +79,8 @@ func (e codeiumExecutor) Execute(ctx context.Context, a *coreauth.Auth, req clip
 
 	var content, reasoning strings.Builder
 	var tools []*toolAcc
+	toolIndexes := map[string]int{}
+	activeToolIndex := -1
 	model := req.Model
 	er := newEnvelopeReader(resp.Body)
 	for {
@@ -101,12 +103,7 @@ func (e codeiumExecutor) Execute(ctx context.Context, a *coreauth.Auth, req clip
 		}
 		content.WriteString(d.content)
 		reasoning.WriteString(d.reasoning)
-		if d.toolID != "" {
-			tools = append(tools, &toolAcc{id: d.toolID, name: d.toolName})
-		}
-		if d.toolArgs != "" && len(tools) > 0 {
-			tools[len(tools)-1].args.WriteString(d.toolArgs)
-		}
+		tools, activeToolIndex = accumulateToolDeltas(tools, toolIndexes, activeToolIndex, d.tools)
 	}
 
 	out := openAICompletion(model, content.String(), reasoning.String(), tools)
@@ -174,7 +171,8 @@ func (e codeiumExecutor) ExecuteStream(ctx context.Context, a *coreauth.Auth, re
 			}
 			return ""
 		}
-		toolIndex := -1
+		toolIndexes := map[string]int{}
+		activeToolIndex := -1
 		sawTool := false
 		for {
 			fr, errRead := er.read()
@@ -201,16 +199,23 @@ func (e codeiumExecutor) ExecuteStream(ctx context.Context, a *coreauth.Auth, re
 					return
 				}
 			}
-			if d.toolID != "" {
-				toolIndex++
-				sawTool = true
-				if !emit(sseToolChunk(id, model, roleFor(), toolIndex, d.toolID, d.toolName, "")) {
-					return
+			for _, tool := range d.tools {
+				if tool.id != "" {
+					toolIndex, alreadyStarted := toolIndexes[tool.id]
+					if !alreadyStarted {
+						toolIndex = len(toolIndexes)
+						toolIndexes[tool.id] = toolIndex
+						sawTool = true
+						if !emit(sseToolChunk(id, model, roleFor(), toolIndex, tool.id, tool.name, "")) {
+							return
+						}
+					}
+					activeToolIndex = toolIndex
 				}
-			}
-			if d.toolArgs != "" && toolIndex >= 0 {
-				if !emit(sseToolChunk(id, model, "", toolIndex, "", "", d.toolArgs)) {
-					return
+				if tool.args != "" && activeToolIndex >= 0 {
+					if !emit(sseToolChunk(id, model, "", activeToolIndex, "", "", tool.args)) {
+						return
+					}
 				}
 			}
 		}
@@ -308,6 +313,29 @@ func trailerError(body []byte) error {
 type toolAcc struct {
 	id, name string
 	args     strings.Builder
+}
+
+// accumulateToolDeltas preserves every tool call in a frame and routes argument
+// fragments by id when the upstream repeats it. Argument-only fragments belong
+// to the most recently active call, matching Codeium's sequential stream form.
+func accumulateToolDeltas(tools []*toolAcc, toolIndexes map[string]int, activeToolIndex int, deltas []toolDelta) ([]*toolAcc, int) {
+	for _, delta := range deltas {
+		if delta.id != "" {
+			toolIndex, exists := toolIndexes[delta.id]
+			if !exists {
+				toolIndex = len(tools)
+				toolIndexes[delta.id] = toolIndex
+				tools = append(tools, &toolAcc{id: delta.id, name: delta.name})
+			} else if delta.name != "" && tools[toolIndex].name == "" {
+				tools[toolIndex].name = delta.name
+			}
+			activeToolIndex = toolIndex
+		}
+		if delta.args != "" && activeToolIndex >= 0 {
+			tools[activeToolIndex].args.WriteString(delta.args)
+		}
+	}
+	return tools, activeToolIndex
 }
 
 func openAICompletion(model, content, reasoning string, tools []*toolAcc) map[string]any {

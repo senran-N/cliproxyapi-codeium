@@ -7,6 +7,7 @@ import "testing"
 // "-1m" sibling as the 1M model, and that reasoning-effort tiers still resolve
 // within each context.
 func TestBuildCatalogContextSplit(t *testing.T) {
+	const accountKey = "account-context-split"
 	entries := []modelEntry{
 		// GLM-5.2 at 200K (the featured default context).
 		{display: "GLM-5.2 High", wire: "glm-5-2-high", base: "GLM-5.2", featured: true, context: 200000},
@@ -50,14 +51,43 @@ func TestBuildCatalogContextSplit(t *testing.T) {
 		{"glm-5.2-1m", "high", "glm-5-2-high-1m"},
 		{"glm-5.2-1m", "max", "glm-5-2-max-1m"},
 	}
-	dynCatMu.Lock()
-	dynBaseWire = baseWire
-	dynFamilies = families
-	dynCatMu.Unlock()
+	storeDynamicCatalog(accountKey, baseWire, families)
 	for _, c := range cases {
-		if got := resolveModelWire(c.id, c.effort); got != c.want {
-			t.Errorf("resolveModelWire(%q, %q) = %q, want %q", c.id, c.effort, got, c.want)
+		if got := resolveModelWire(accountKey, c.id, c.effort); got != c.want {
+			t.Errorf("resolveModelWire(%q, %q, %q) = %q, want %q", accountKey, c.id, c.effort, got, c.want)
 		}
+	}
+}
+
+func TestDynamicCatalogsAreIsolatedPerAccount(t *testing.T) {
+	const modelID = "shared-friendly-model"
+	storeDynamicCatalog("account-a", map[string]string{modelID: "wire-for-a"}, map[string]map[string]string{
+		modelID: {"high": "wire-for-a-high"},
+	})
+	storeDynamicCatalog("account-b", map[string]string{modelID: "wire-for-b"}, map[string]map[string]string{
+		modelID: {"high": "wire-for-b-high"},
+	})
+
+	if got := resolveModelWire("account-a", modelID, "high"); got != "wire-for-a-high" {
+		t.Fatalf("account-a resolved to %q", got)
+	}
+	if got := resolveModelWire("account-b", modelID, "high"); got != "wire-for-b-high" {
+		t.Fatalf("account-b resolved to %q", got)
+	}
+	if got := resolveModelWire("unknown-account", modelID, "high"); got != modelID {
+		t.Fatalf("unknown account resolved to %q, want pass-through model id", got)
+	}
+}
+
+func TestBuildCatalogReturnsStableModelOrder(t *testing.T) {
+	entries := []modelEntry{
+		{display: "Zulu High", wire: "zulu-high", base: "Zulu", featured: true, context: 200000},
+		{display: "Alpha High", wire: "alpha-high", base: "Alpha", featured: true, context: 200000},
+	}
+
+	list, _, _ := buildCatalog(entries)
+	if len(list) != 2 || list[0].ID != "alpha" || list[1].ID != "zulu" {
+		t.Fatalf("catalogue order is not stable: %+v", list)
 	}
 }
 

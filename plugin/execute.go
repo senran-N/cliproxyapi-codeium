@@ -18,9 +18,34 @@ type toolAcc struct {
 	args     strings.Builder
 }
 
+// accumulateToolDeltas preserves every tool call in a frame and routes argument
+// fragments by id when the upstream repeats it. Argument-only fragments belong
+// to the most recently active call, matching Codeium's sequential stream form.
+func accumulateToolDeltas(tools []*toolAcc, toolIndexes map[string]int, activeToolIndex int, deltas []toolDelta) ([]*toolAcc, int) {
+	for _, delta := range deltas {
+		if delta.id != "" {
+			toolIndex, exists := toolIndexes[delta.id]
+			if !exists {
+				toolIndex = len(tools)
+				toolIndexes[delta.id] = toolIndex
+				tools = append(tools, &toolAcc{id: delta.id, name: delta.name})
+			} else if delta.name != "" && tools[toolIndex].name == "" {
+				tools[toolIndex].name = delta.name
+			}
+			activeToolIndex = toolIndex
+		}
+		if delta.args != "" && activeToolIndex >= 0 {
+			tools[activeToolIndex].args.WriteString(delta.args)
+		}
+	}
+	return tools, activeToolIndex
+}
+
 // openUpstream mints a JWT and opens the streaming GetChatMessage request.
-func openUpstream(ctx context.Context, cfg providerConfig, oai oaiRequest) (*http.Response, error) {
-	client := http.DefaultClient
+func openUpstream(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest) (*http.Response, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
 	entry, err := getValidJWT(ctx, client, cfg)
 	if err != nil {
 		return nil, err
@@ -59,8 +84,8 @@ func openUpstream(ctx context.Context, cfg providerConfig, oai oaiRequest) (*htt
 }
 
 // executeNonStream drains the upstream stream into a single OpenAI completion.
-func executeNonStream(ctx context.Context, cfg providerConfig, oai oaiRequest) ([]byte, error) {
-	resp, err := openUpstream(ctx, cfg, oai)
+func executeNonStream(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest) ([]byte, error) {
+	resp, err := openUpstream(ctx, client, cfg, oai)
 	if err != nil {
 		return nil, err
 	}
@@ -68,6 +93,8 @@ func executeNonStream(ctx context.Context, cfg providerConfig, oai oaiRequest) (
 
 	var content, reasoning strings.Builder
 	var tools []*toolAcc
+	toolIndexes := map[string]int{}
+	activeToolIndex := -1
 	model := oai.Model
 	er := newEnvelopeReader(resp.Body)
 	for {
@@ -90,29 +117,37 @@ func executeNonStream(ctx context.Context, cfg providerConfig, oai oaiRequest) (
 		}
 		content.WriteString(d.content)
 		reasoning.WriteString(d.reasoning)
-		if d.toolID != "" {
-			tools = append(tools, &toolAcc{id: d.toolID, name: d.toolName})
-		}
-		if d.toolArgs != "" && len(tools) > 0 {
-			tools[len(tools)-1].args.WriteString(d.toolArgs)
-		}
+		tools, activeToolIndex = accumulateToolDeltas(tools, toolIndexes, activeToolIndex, d.tools)
 	}
 	return json.Marshal(openAICompletion(model, content.String(), reasoning.String(), tools))
 }
 
-// executeStream drains the upstream stream into OpenAI SSE chunks. The plugin
-// buffers the full response and returns all chunks; the host streams and
-// translates them to the client protocol.
-func executeStream(ctx context.Context, cfg providerConfig, oai oaiRequest) ([][]byte, error) {
-	resp, err := openUpstream(ctx, cfg, oai)
+// executeStream is the compatibility path for hosts that do not provide an
+// output stream id. Current hosts use executeStreamTo for immediate delivery.
+func executeStream(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest) ([][]byte, error) {
+	var chunks [][]byte
+	err := executeStreamTo(ctx, client, cfg, oai, func(chunk []byte) error {
+		chunks = append(chunks, append([]byte(nil), chunk...))
+		return nil
+	})
+	return chunks, err
+}
+
+// executeStreamTo forwards each translated SSE chunk as soon as the upstream
+// frame arrives. Dynamic-library execution uses this to avoid buffering the
+// complete model response inside the plugin.
+func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest, emit func([]byte) error) error {
+	if emit == nil {
+		return fmt.Errorf("codeium: stream emitter is nil")
+	}
+	resp, err := openUpstream(ctx, client, cfg, oai)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	id := "chatcmpl-" + nowID()
 	model := oai.Model
-	var chunks [][]byte
 	first := true
 	roleFor := func() string {
 		if first {
@@ -121,7 +156,8 @@ func executeStream(ctx context.Context, cfg providerConfig, oai oaiRequest) ([][
 		}
 		return ""
 	}
-	toolIndex := -1
+	toolIndexes := map[string]int{}
+	activeToolIndex := -1
 	sawTool := false
 	er := newEnvelopeReader(resp.Body)
 	for {
@@ -130,11 +166,11 @@ func executeStream(ctx context.Context, cfg providerConfig, oai oaiRequest) ([][
 			break
 		}
 		if errRead != nil {
-			return nil, errRead
+			return errRead
 		}
 		if fr.end {
 			if te := trailerError(fr.body); te != nil {
-				return nil, te
+				return te
 			}
 			continue
 		}
@@ -143,24 +179,38 @@ func executeStream(ctx context.Context, cfg providerConfig, oai oaiRequest) ([][
 			model = d.model
 		}
 		if d.content != "" || d.reasoning != "" {
-			chunks = append(chunks, sseChunk(id, model, roleFor(), d.content, d.reasoning, ""))
+			if errEmit := emit(sseChunk(id, model, roleFor(), d.content, d.reasoning, "")); errEmit != nil {
+				return errEmit
+			}
 		}
-		if d.toolID != "" {
-			toolIndex++
-			sawTool = true
-			chunks = append(chunks, sseToolChunk(id, model, roleFor(), toolIndex, d.toolID, d.toolName, ""))
-		}
-		if d.toolArgs != "" && toolIndex >= 0 {
-			chunks = append(chunks, sseToolChunk(id, model, "", toolIndex, "", "", d.toolArgs))
+		for _, tool := range d.tools {
+			if tool.id != "" {
+				toolIndex, alreadyStarted := toolIndexes[tool.id]
+				if !alreadyStarted {
+					toolIndex = len(toolIndexes)
+					toolIndexes[tool.id] = toolIndex
+					sawTool = true
+					if errEmit := emit(sseToolChunk(id, model, roleFor(), toolIndex, tool.id, tool.name, "")); errEmit != nil {
+						return errEmit
+					}
+				}
+				activeToolIndex = toolIndex
+			}
+			if tool.args != "" && activeToolIndex >= 0 {
+				if errEmit := emit(sseToolChunk(id, model, "", activeToolIndex, "", "", tool.args)); errEmit != nil {
+					return errEmit
+				}
+			}
 		}
 	}
 	finish := "stop"
 	if sawTool {
 		finish = "tool_calls"
 	}
-	chunks = append(chunks, sseChunk(id, model, "", "", "", finish))
-	chunks = append(chunks, []byte("data: [DONE]\n\n"))
-	return chunks, nil
+	if errEmit := emit(sseChunk(id, model, "", "", "", finish)); errEmit != nil {
+		return errEmit
+	}
+	return emit([]byte("data: [DONE]\n\n"))
 }
 
 // trailerError inspects an end-of-stream trailer frame for a Connect error.

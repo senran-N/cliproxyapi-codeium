@@ -31,7 +31,7 @@ func TestFetchModelCatalogLive(t *testing.T) {
 	fmt.Println("----- variant composition (base + effort) -----")
 	for _, id := range []string{"claude-opus-4.8", "gpt-5.6-sol", "glm-5.2"} {
 		for _, eff := range []string{"", "low", "high", "xhigh", "max"} {
-			fmt.Printf("  %-16s effort=%-6s -> %s\n", id, eff, resolveModelWire(id, eff))
+			fmt.Printf("  %-16s effort=%-6s -> %s\n", id, eff, resolveModelWire(cfg.sessionToken, id, eff))
 		}
 	}
 	fmt.Println("=============================")

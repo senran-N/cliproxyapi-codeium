@@ -152,8 +152,8 @@ func buildChatRequest(cfg providerConfig, jwt string, oai oaiRequest) ([]byte, s
 
 	req.str(16, uuid.NewString()) // turn id
 	req.varintAlways(20, 1)
-	req.str(21, resolveModelWire(model, oai.ReasoningEffort)) // friendly id (+ effort) -> wire id
-	req.str(22, uuid.NewString())                             // conversation id
+	req.str(21, resolveModelWire(cfg.sessionToken, model, oai.ReasoningEffort)) // account model (+ effort) -> wire id
+	req.str(22, uuid.NewString())                                               // conversation id
 	return req.bytes(), model
 }
 
@@ -202,9 +202,13 @@ type respDelta struct {
 	content   string
 	reasoning string
 	model     string
-	toolID    string // f6.f1 (only on a tool-call start frame)
-	toolName  string // f6.f2
-	toolArgs  string // f6.f3 (streamed argument delta)
+	tools     []toolDelta
+}
+
+type toolDelta struct {
+	id   string // f6.f1 (usually present only on a tool-call start frame)
+	name string // f6.f2
+	args string // f6.f3 (streamed argument delta)
 }
 
 // parseResponseFrame extracts content (f3), reasoning (f9), tool calls (f6), and
@@ -223,6 +227,7 @@ func parseResponseFrame(body []byte) respDelta {
 		case f == 9 && wire == 2:
 			d.reasoning += string(sub)
 		case f == 6 && wire == 2:
+			var tool toolDelta
 			tr := newPR(sub)
 			for !tr.eof() {
 				tf, tw, tsub, _, terr := tr.next()
@@ -234,12 +239,15 @@ func parseResponseFrame(body []byte) respDelta {
 				}
 				switch tf {
 				case 1:
-					d.toolID = string(tsub)
+					tool.id = string(tsub)
 				case 2:
-					d.toolName = string(tsub)
+					tool.name = string(tsub)
 				case 3:
-					d.toolArgs += string(tsub)
+					tool.args += string(tsub)
 				}
+			}
+			if tool.id != "" || tool.name != "" || tool.args != "" {
+				d.tools = append(d.tools, tool)
 			}
 		case f == 7 && wire == 2:
 			// nested metadata { f9: model }

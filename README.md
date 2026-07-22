@@ -101,7 +101,7 @@ codeiumExecutor
         │  1. session_token ──► exa.auth_pb.AuthService/GetUserJwt ──► short-lived api JWT (cached, auto-refreshed by exp)
         │  2. build GetChatMessageRequest protobuf (metadata + system + messages + tools + model=f21)
         │  3. POST exa.api_server_pb.ApiServerService/GetChatMessage   (Connect-RPC, application/connect+proto, gzip)
-        │  4. parse streamed frames (f9 = text delta) ──► OpenAI SSE / completion
+        │  4. parse streamed frames (f3 = answer, f9 = reasoning) ──► OpenAI SSE / completion
         ▼
 server.codeium.com
 ```
@@ -157,9 +157,9 @@ install identifiers.
 ## Run
 
 ```bash
-cd examples/devin-codeium/example
-go run ../ --config ./config.yaml
-# proxy on :8317, auth files in ./auths
+cd cliproxyapi-codeium
+go run .
+# reads ./config.yaml; listen address and auth dir come from that CLIProxyAPI config
 ```
 
 ```bash
@@ -196,9 +196,10 @@ content:   "pong"
 - **Response mapping** — `f3` → `content` (the answer), `f9` →
   `reasoning_content` (the chain-of-thought). ✅
 - **Model ids must be the internal enum** — the backend rejects display names.
-  Send a friendly id from the table below (mapped automatically to the `MODEL_*`
-  enum in `models.go`), or the raw enum. Using a display name like
-  `claude-sonnet-5` yields `permission_denied`.
+  Send a friendly id advertised by `/v1/models` (mapped automatically to the
+  account's wire id), or the raw wire id. Sending a human-readable picker label
+  such as `Claude Sonnet 5 High Thinking` as the model id can yield
+  `permission_denied`.
 - **Static client config** — `f7/f8/f9/f13` (incl. the Cascade capability block)
   are replayed from `staticconfig.go`; omitting them yields
   `failed_precondition: please update your editor`. Refresh the blob if you bump
@@ -214,13 +215,14 @@ always reflects what your account currently offers. Only the stable `swe-1-7` /
 To reproduce the live check:
 
 ```bash
-CODEIUM_SESSION_TOKEN='devin-session-token$...' CODEIUM_MODEL=swe-1-7 \
-  go test -v -run TestSmokeLive ./examples/devin-codeium/
+CODEIUM_SESSION_TOKEN='devin-session-token$...' \
+  go test -v -run TestFetchModelCatalogLive .
 ```
 
-Possible future refinement: **tool-call id mapping** (Codeium uses
-`functions.<name>:<idx>`; round-tripping OpenAI `tool_calls` may need tuning for
-multi-tool agent flows).
+Tool-call ids are preserved verbatim across assistant calls and tool results.
+Stream frames containing multiple calls are decoded independently, and argument
+fragments carrying an id are routed back to the matching call rather than being
+blindly appended to the most recent call.
 
 ## Concurrency & multi-credential isolation
 
@@ -228,23 +230,31 @@ Designed for CPA importing several Devin accounts and serving many concurrent
 requests:
 
 - **Per-account isolation** — all state (JWT cache, device fingerprint,
-  team/user ids) is keyed by the account's session token. Two imported accounts
-  never share a JWT or a device identity; each presents its **own** fingerprint,
+  team/user ids, live model catalogue, and reasoning-variant mappings) is keyed
+  by the account's session token. Two imported accounts never share a JWT,
+  device identity, or model wire mapping; each presents its **own** fingerprint,
   so a device-scoped rate limit on the backend treats them independently
-  (importing N accounts actually multiplies capacity).
+  (importing N accounts actually multiplies capacity). Replacing a token on an
+  existing auth record invalidates and refetches its model catalogue.
 - **No thundering herd** — concurrent requests that find an expired JWT collapse
   into a single `GetUserJwt` refresh per account via `singleflight`; the refresh
   runs on a detached, bounded context so one caller cancelling cannot poison the
   shared result.
 - **No goroutine/connection leaks** — streaming sends select on the request
   context and abort on client disconnect (closing the upstream body); HTTP
-  clients are pooled per proxy URL instead of rebuilt per request.
+  clients are pooled per proxy URL instead of rebuilt per request. Standalone
+  model discovery uses the same per-auth proxy and has a bounded fetch timeout.
+- **Host-managed plugin transport** — the dynamic-library plugin sends auth,
+  model discovery, and chat traffic through CLIProxyAPI's `host.http.*`
+  callbacks. Host proxy policy and request logging therefore apply uniformly,
+  and streaming chunks are emitted immediately through the host-owned stream
+  instead of being buffered until generation completes.
 - **No shared mutable request state** — `providerConfig` is a per-request value
   copy; the executor is stateless; conversation/turn ids are fresh per request.
 
 Verified by `concurrency_test.go` (fingerprint isolation/stability, 200-goroutine
 cache access, single-flight collapse to exactly one refresh). Run
-`go test ./examples/devin-codeium/`; add `-race` on a host with a C toolchain.
+`go test ./...`; add `-race` on a host with a C toolchain and CGO enabled.
 
 ## Route through Reqable to debug
 

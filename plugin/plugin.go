@@ -43,29 +43,40 @@ extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
 
-static const cliproxy_host_api* stored_host;
+static cliproxy_host_api stored_host;
+static int stored_host_available;
 
 static void store_host_api(const cliproxy_host_api* host) {
-	stored_host = host;
+	if (host == NULL) {
+		stored_host_available = 0;
+		return;
+	}
+	stored_host = *host;
+	stored_host_available = 1;
+}
+
+static int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (!stored_host_available || stored_host.call == NULL) {
+		return 1;
+	}
+	return stored_host.call(stored_host.host_ctx, method, request, request_len, response);
+}
+
+static void free_host_buffer(void* ptr, size_t len) {
+	if (stored_host_available && stored_host.free_buffer != NULL && ptr != NULL) {
+		stored_host.free_buffer(ptr, len);
+	}
 }
 */
 import "C"
 
 import (
-	"context"
 	"encoding/json"
+	"fmt"
 	"unsafe"
 )
 
 const abiVersion uint32 = 1
-
-// pluginName/Version/Author are surfaced to management clients and the registry.
-const (
-	pluginName    = "codeium"
-	pluginVersion = "0.1.0"
-	pluginAuthor  = "senran-N"
-	pluginRepo    = "https://github.com/senran-N/cliproxyapi-codeium"
-)
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -78,38 +89,11 @@ type envelopeError struct {
 	Message string `json:"message"`
 }
 
-// executorRequest mirrors the host's pluginapi.ExecutorRequest wire form (only
-// the fields this plugin consumes). []byte fields arrive base64-encoded.
-type executorRequest struct {
-	Model           string
-	Stream          bool
-	Payload         []byte
-	OriginalRequest []byte
-	SourceFormat    string
-	Metadata        map[string]any
-	AuthMetadata    map[string]any
-	AuthAttributes  map[string]string
-}
-
-type execResult struct {
-	Payload []byte              `json:"Payload"`
-	Headers map[string][]string `json:"Headers,omitempty"`
-}
-
-type streamResult struct {
-	Headers map[string][]string `json:"headers,omitempty"`
-	Chunks  []streamChunk       `json:"chunks"`
-}
-
-type streamChunk struct {
-	Payload []byte `json:"Payload"`
-}
-
 func main() {}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	if plugin == nil {
+	if host == nil || plugin == nil || uint32(host.abi_version) != abiVersion {
 		return 1
 	}
 	C.store_host_api(host)
@@ -154,130 +138,6 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {}
 
-// handleMethod dispatches a host RPC. On success it returns the method result
-// JSON; on failure it returns an error code + message.
-func handleMethod(method string, request []byte) (result json.RawMessage, code, message string) {
-	switch method {
-	case "plugin.register", "plugin.reconfigure":
-		return json.RawMessage(registerJSON()), "", ""
-	case "executor.identifier":
-		return json.RawMessage(`{"identifier":"` + providerKey + `"}`), "", ""
-	case "model.static":
-		return json.RawMessage(modelsJSON(codeiumModels)), "", ""
-	case "model.for_auth":
-		return modelsForAuth(request), "", ""
-	case "executor.execute":
-		return runExecute(request, false)
-	case "executor.execute_stream":
-		return runExecute(request, true)
-	case "executor.count_tokens":
-		return nil, "unsupported", "count_tokens is not supported"
-	case "executor.http_request":
-		return nil, "unsupported", "http_request is not supported"
-	default:
-		return nil, "unknown_method", "unknown method: " + method
-	}
-}
-
-func runExecute(request []byte, stream bool) (json.RawMessage, string, string) {
-	var er executorRequest
-	if err := json.Unmarshal(request, &er); err != nil {
-		return nil, "invalid_request", "decode executor request: " + err.Error()
-	}
-	cfg := configFromMaps(er.AuthAttributes, er.AuthMetadata)
-	payload := er.Payload
-	if len(payload) == 0 {
-		payload = er.OriginalRequest
-	}
-	var oai oaiRequest
-	if err := json.Unmarshal(payload, &oai); err != nil {
-		return nil, "invalid_request", "decode chat payload: " + err.Error()
-	}
-	if oai.Model == "" {
-		oai.Model = er.Model
-	}
-	// Reasoning effort (used to compose thinking variants) may come in the payload
-	// or in the host execution metadata.
-	if oai.ReasoningEffort == "" {
-		if v, ok := er.Metadata["reasoning_effort"].(string); ok {
-			oai.ReasoningEffort = v
-		}
-	}
-	ctx := context.Background()
-	if !stream {
-		body, err := executeNonStream(ctx, cfg, oai)
-		if err != nil {
-			return nil, "execute_failed", err.Error()
-		}
-		out, _ := json.Marshal(execResult{Payload: body, Headers: map[string][]string{"Content-Type": {"application/json"}}})
-		return out, "", ""
-	}
-	chunks, err := executeStream(ctx, cfg, oai)
-	if err != nil {
-		return nil, "execute_failed", err.Error()
-	}
-	sc := make([]streamChunk, 0, len(chunks))
-	for _, c := range chunks {
-		sc = append(sc, streamChunk{Payload: c})
-	}
-	out, _ := json.Marshal(streamResult{Headers: map[string][]string{"Content-Type": {"text/event-stream"}}, Chunks: sc})
-	return out, "", ""
-}
-
-// registerJSON declares the plugin metadata + executor/model_provider capabilities.
-func registerJSON() string {
-	meta := map[string]any{
-		"Name":             pluginName,
-		"Version":          pluginVersion,
-		"Author":           pluginAuthor,
-		"GitHubRepository": pluginRepo,
-		"Logo":             "",
-		"ConfigFields":     []any{},
-	}
-	caps := map[string]any{
-		"executor":                true,
-		"executor_model_scope":    "both",
-		"executor_input_formats":  []string{"chat-completions"},
-		"executor_output_formats": []string{"chat-completions"},
-		"model_provider":          true,
-	}
-	b, _ := json.Marshal(map[string]any{"schema_version": 1, "metadata": meta, "capabilities": caps})
-	return string(b)
-}
-
-// modelsForAuth returns the account's live model catalogue, fetched from the
-// backend using the auth's session token, falling back to the static list.
-func modelsForAuth(request []byte) json.RawMessage {
-	var r struct {
-		Metadata   map[string]any    `json:"Metadata"`
-		Attributes map[string]string `json:"Attributes"`
-	}
-	_ = json.Unmarshal(request, &r)
-	cfg := configFromMaps(r.Attributes, r.Metadata)
-	models := fetchModelCatalog(context.Background(), cfg)
-	if len(models) == 0 {
-		models = codeiumModels
-	}
-	return json.RawMessage(modelsJSON(models))
-}
-
-// modelsJSON renders a model list for model.static/for_auth.
-func modelsJSON(list []modelDef) string {
-	models := make([]map[string]any, 0, len(list))
-	for _, m := range list {
-		models = append(models, map[string]any{
-			"ID":                         m.ID,
-			"Object":                     "model",
-			"OwnedBy":                    providerKey,
-			"DisplayName":                m.Display,
-			"SupportedGenerationMethods": []string{"chat"},
-			"UserDefined":                true,
-		})
-	}
-	b, _ := json.Marshal(map[string]any{"Provider": providerKey, "Models": models})
-	return string(b)
-}
-
 func mustEnvelope(ok bool, result json.RawMessage, code, message string) []byte {
 	e := envelope{OK: ok, Result: result}
 	if !ok {
@@ -297,4 +157,39 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+}
+
+// callHost invokes a CLIProxyAPI host callback and decodes its standard RPC
+// envelope. The host owns the returned C buffer, so it must be released through
+// the host's matching allocator rather than C.free.
+func callHost(method string, request []byte) ([]byte, error) {
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var cRequest unsafe.Pointer
+	if len(request) > 0 {
+		cRequest = C.CBytes(request)
+		if cRequest == nil {
+			return nil, fmt.Errorf("codeium plugin: allocate host callback request")
+		}
+		defer C.free(cRequest)
+	}
+
+	var response C.cliproxy_buffer
+	resultCode := C.call_host_api(
+		cMethod,
+		(*C.uint8_t)(cRequest),
+		C.size_t(len(request)),
+		&response,
+	)
+	if response.ptr != nil {
+		defer C.free_host_buffer(response.ptr, response.len)
+	}
+	if resultCode != 0 {
+		return nil, fmt.Errorf("codeium plugin: host callback %s failed with code %d", method, int(resultCode))
+	}
+	if response.ptr == nil || response.len == 0 {
+		return nil, fmt.Errorf("codeium plugin: host callback %s returned an empty response", method)
+	}
+	return C.GoBytes(response.ptr, C.int(response.len)), nil
 }
