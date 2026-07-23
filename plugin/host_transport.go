@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -17,6 +18,8 @@ const (
 	hostHTTPStreamCloseMethod = "host.http.stream_close"
 	hostStreamEmitMethod      = "host.stream.emit"
 	hostStreamCloseMethod     = "host.stream.close"
+	hostAuthGetMethod         = "host.auth.get"
+	hostAuthSaveMethod        = "host.auth.save"
 )
 
 var invokeRawHostCallback = callHost
@@ -76,6 +79,21 @@ type hostStreamCloseRequest struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type hostAuthGetRequest struct {
+	AuthIndex string `json:"auth_index"`
+}
+
+type hostAuthGetResponse struct {
+	AuthIndex string          `json:"auth_index"`
+	Name      string          `json:"name"`
+	JSON      json.RawMessage `json:"json"`
+}
+
+type hostAuthSaveRequest struct {
+	Name string          `json:"name"`
+	JSON json.RawMessage `json:"json"`
+}
+
 type pluginHostTransport struct {
 	hostCallbackID string
 }
@@ -85,6 +103,22 @@ type pluginHostTransport struct {
 // cancellation context instead of bypassing them through http.DefaultClient.
 func buildPluginHTTPClient(hostCallbackID string) *http.Client {
 	return &http.Client{Transport: &pluginHostTransport{hostCallbackID: strings.TrimSpace(hostCallbackID)}}
+}
+
+func buildDirectHTTPClient(proxyAddress string) (*http.Client, error) {
+	defaultTransport, transportAvailable := http.DefaultTransport.(*http.Transport)
+	if !transportAvailable {
+		return nil, fmt.Errorf("codeium plugin: default HTTP transport is unavailable")
+	}
+	transport := defaultTransport.Clone()
+	if strings.TrimSpace(proxyAddress) != "" {
+		parsedProxyURL, errParse := url.Parse(strings.TrimSpace(proxyAddress))
+		if errParse != nil || parsedProxyURL.Scheme == "" || parsedProxyURL.Host == "" {
+			return nil, fmt.Errorf("codeium plugin: invalid host proxy URL")
+		}
+		transport.Proxy = http.ProxyURL(parsedProxyURL)
+	}
+	return &http.Client{Transport: transport}, nil
 }
 
 func (transport *pluginHostTransport) RoundTrip(request *http.Request) (*http.Response, error) {

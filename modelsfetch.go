@@ -15,8 +15,9 @@ import (
 // Accounts can expose different models or map the same friendly id to different
 // wire variants, so catalogues must never be shared across credentials.
 type dynamicCatalog struct {
-	baseWire map[string]string
-	families map[string]map[string]string
+	baseWire     map[string]string
+	families     map[string]map[string]string
+	imageSupport map[string]bool
 }
 
 var (
@@ -50,10 +51,44 @@ func resolveDynamic(accountKey, id, effort string) (string, bool) {
 	return "", false
 }
 
-func storeDynamicCatalog(accountKey string, baseWire map[string]string, families map[string]map[string]string) {
+func storeDynamicCatalog(accountKey string, baseWire map[string]string, families map[string]map[string]string, modelLists ...[]modelDef) {
+	imageSupport := buildModelImageSupport(families, modelLists...)
 	dynamicCatalogsMu.Lock()
-	dynamicCatalogs[accountKey] = dynamicCatalog{baseWire: baseWire, families: families}
+	dynamicCatalogs[accountKey] = dynamicCatalog{baseWire: baseWire, families: families, imageSupport: imageSupport}
 	dynamicCatalogsMu.Unlock()
+}
+
+func buildModelImageSupport(families map[string]map[string]string, modelLists ...[]modelDef) map[string]bool {
+	if len(modelLists) == 0 {
+		return nil
+	}
+	imageSupport := make(map[string]bool)
+	for _, model := range modelLists[0] {
+		if !model.ImageSupportKnown {
+			continue
+		}
+		imageSupport[model.ID] = model.SupportsImages
+		imageSupport[model.Wire] = model.SupportsImages
+		for _, wireModel := range families[model.ID] {
+			imageSupport[wireModel] = model.SupportsImages
+		}
+	}
+	return imageSupport
+}
+
+func lookupModelImageSupport(accountKey, modelID, effort string) (bool, bool) {
+	resolvedModel := resolveModelWire(accountKey, modelID, effort)
+	dynamicCatalogsMu.RLock()
+	defer dynamicCatalogsMu.RUnlock()
+	catalog, catalogExists := dynamicCatalogs[accountKey]
+	if !catalogExists {
+		return false, false
+	}
+	if supportsImages, supportKnown := catalog.imageSupport[modelID]; supportKnown {
+		return supportsImages, true
+	}
+	supportsImages, supportKnown := catalog.imageSupport[resolvedModel]
+	return supportsImages, supportKnown
 }
 
 // normalizeEffort maps an OpenAI reasoning_effort / thinking level to a tier key.
@@ -147,7 +182,7 @@ func fetchModelCatalogWithClient(ctx context.Context, client *http.Client, cfg p
 	if len(list) == 0 {
 		return nil
 	}
-	storeDynamicCatalog(cfg.sessionToken, baseWire, families)
+	storeDynamicCatalog(cfg.sessionToken, baseWire, families, list)
 	return list
 }
 
@@ -156,6 +191,10 @@ func fetchModelCatalogWithClient(ctx context.Context, client *http.Client, cfg p
 // Split out from fetchModelCatalog so the bucketing is unit-testable without a
 // live account.
 func buildCatalog(entries []modelEntry) (list []modelDef, baseWire map[string]string, families map[string]map[string]string) {
+	wireImageSupport := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		wireImageSupport[entry.wire] = entry.supportsImages
+	}
 	// Pass 1: learn each base family's default (featured) tier + context window.
 	// The featured entry is what the Devin picker shows by default — for GLM that
 	// is the 200K "High", not the 1M variant — so we treat its context as the
@@ -245,7 +284,13 @@ func buildCatalog(entries []modelEntry) (list []modelDef, baseWire map[string]st
 			continue
 		}
 		baseWire[key] = wire
-		list = append(list, modelDef{ID: key, Display: keyDisplay[key], Wire: wire})
+		list = append(list, modelDef{
+			ID:                key,
+			Display:           keyDisplay[key],
+			Wire:              wire,
+			SupportsImages:    wireImageSupport[wire],
+			ImageSupportKnown: true,
+		})
 	}
 	sort.Slice(list, func(firstIndex, secondIndex int) bool {
 		return list[firstIndex].ID < list[secondIndex].ID
@@ -309,6 +354,7 @@ func parseModelEntries(raw []byte) []modelEntry {
 type modelEntry struct {
 	display, wire, base string
 	featured            bool
+	supportsImages      bool
 	context             uint64 // f18 = context window length
 }
 
@@ -322,6 +368,8 @@ func parseModelEntry(b []byte) modelEntry {
 			break
 		}
 		switch {
+		case w == 0 && f == 5:
+			e.supportsImages = v == 1
 		case w == 0 && f == 11:
 			e.featured = v == 1
 		case w == 0 && f == 18:

@@ -29,16 +29,18 @@ const (
 )
 
 type persistedCredentials struct {
-	Type         string `json:"type"`
-	SessionToken string `json:"session_token"`
-	TeamID       string `json:"team_id,omitempty"`
-	UserID       string `json:"user_id,omitempty"`
-	AccountID    string `json:"account_id,omitempty"`
-	OrgID        string `json:"org_id,omitempty"`
+	Type         string                 `json:"type"`
+	SessionToken string                 `json:"session_token"`
+	TeamID       string                 `json:"team_id,omitempty"`
+	UserID       string                 `json:"user_id,omitempty"`
+	AccountID    string                 `json:"account_id,omitempty"`
+	OrgID        string                 `json:"org_id,omitempty"`
+	ModelCatalog *persistedModelCatalog `json:"model_catalog,omitempty"`
 }
 
 type pluginHostConfig struct {
-	AuthDir string `json:"AuthDir"`
+	AuthDir  string `json:"AuthDir"`
+	ProxyURL string `json:"ProxyURL"`
 }
 
 type pluginAuthData struct {
@@ -184,6 +186,7 @@ func pollLogin(requestJSON []byte) (json.RawMessage, string, string) {
 	if errValidate := validateCredentials(exchangeContext, httpClient, &credentials); errValidate != nil {
 		return loginStatusResponse("error", "Codeium session validation failed: "+errValidate.Error(), nil), "", ""
 	}
+	refreshPersistedModelCatalog(exchangeContext, httpClient, &credentials)
 	authData, errAuthData := buildAuthData(credentials, "", "")
 	if errAuthData != nil {
 		return nil, "auth_failed", errAuthData.Error()
@@ -210,6 +213,7 @@ func refreshAuth(requestJSON []byte) (json.RawMessage, string, string) {
 	if errValidate := validateCredentials(validationContext, buildPluginHTTPClient(request.HostCallbackID), &credentials); errValidate != nil {
 		return nil, "refresh_failed", errValidate.Error()
 	}
+	refreshPersistedModelCatalog(validationContext, buildPluginHTTPClient(request.HostCallbackID), &credentials)
 	authData, errAuthData := buildAuthData(credentials, "", request.AuthID)
 	if errAuthData != nil {
 		return nil, "refresh_failed", errAuthData.Error()
@@ -280,6 +284,7 @@ func validateCredentials(ctx context.Context, client *http.Client, credentials *
 	if errJWT != nil {
 		return errJWT
 	}
+	jwts.put(credentials.SessionToken, jwt)
 	credentials.Type = providerKey
 	if strings.TrimSpace(credentials.UserID) == "" {
 		credentials.UserID = jwt.userID
@@ -288,6 +293,24 @@ func validateCredentials(ctx context.Context, client *http.Client, credentials *
 		credentials.TeamID = jwt.teamID
 	}
 	return nil
+}
+
+func refreshPersistedModelCatalog(ctx context.Context, client *http.Client, credentials *persistedCredentials) {
+	if credentials == nil || strings.TrimSpace(credentials.SessionToken) == "" {
+		return
+	}
+	providerConfig := configFromAuthData(mustMarshalCredentials(*credentials), nil, nil)
+	refreshPersistedModelCatalogWithConfig(ctx, client, credentials, providerConfig)
+}
+
+func refreshPersistedModelCatalogWithConfig(ctx context.Context, client *http.Client, credentials *persistedCredentials, providerConfig providerConfig) {
+	if credentials == nil || strings.TrimSpace(credentials.SessionToken) == "" {
+		return
+	}
+	models := fetchModelCatalogWithClient(ctx, client, providerConfig)
+	if catalog := snapshotDynamicCatalog(credentials.SessionToken, models); catalog != nil {
+		credentials.ModelCatalog = catalog
+	}
 }
 
 func buildAuthData(credentials persistedCredentials, fileName, authID string) (pluginAuthData, error) {

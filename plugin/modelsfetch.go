@@ -9,14 +9,25 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
+
+const modelCatalogRefreshInterval = 6 * time.Hour
 
 // dynamicCatalog contains one account's friendly-model resolution tables.
 // Accounts can expose different models or map the same friendly id to different
 // wire variants, so catalogues must never be shared across credentials.
 type dynamicCatalog struct {
-	baseWire map[string]string
-	families map[string]map[string]string
+	baseWire     map[string]string
+	families     map[string]map[string]string
+	imageSupport map[string]bool
+}
+
+type persistedModelCatalog struct {
+	Models    []modelDef                   `json:"models"`
+	BaseWire  map[string]string            `json:"base_wire"`
+	Families  map[string]map[string]string `json:"families"`
+	FetchedAt time.Time                    `json:"fetched_at"`
 }
 
 var (
@@ -50,10 +61,101 @@ func resolveDynamic(accountKey, id, effort string) (string, bool) {
 	return "", false
 }
 
-func storeDynamicCatalog(accountKey string, baseWire map[string]string, families map[string]map[string]string) {
+func storeDynamicCatalog(accountKey string, baseWire map[string]string, families map[string]map[string]string, modelLists ...[]modelDef) {
+	imageSupport := buildModelImageSupport(families, modelLists...)
 	dynamicCatalogsMu.Lock()
-	dynamicCatalogs[accountKey] = dynamicCatalog{baseWire: baseWire, families: families}
+	dynamicCatalogs[accountKey] = dynamicCatalog{baseWire: baseWire, families: families, imageSupport: imageSupport}
 	dynamicCatalogsMu.Unlock()
+}
+
+func buildModelImageSupport(families map[string]map[string]string, modelLists ...[]modelDef) map[string]bool {
+	if len(modelLists) == 0 {
+		return nil
+	}
+	imageSupport := make(map[string]bool)
+	for _, model := range modelLists[0] {
+		if !model.ImageSupportKnown {
+			continue
+		}
+		imageSupport[model.ID] = model.SupportsImages
+		imageSupport[model.Wire] = model.SupportsImages
+		for _, wireModel := range families[model.ID] {
+			imageSupport[wireModel] = model.SupportsImages
+		}
+	}
+	return imageSupport
+}
+
+func lookupModelImageSupport(accountKey, modelID, effort string) (bool, bool) {
+	resolvedModel := resolveModelWire(accountKey, modelID, effort)
+	dynamicCatalogsMu.RLock()
+	defer dynamicCatalogsMu.RUnlock()
+	catalog, catalogExists := dynamicCatalogs[accountKey]
+	if !catalogExists {
+		return false, false
+	}
+	if supportsImages, supportKnown := catalog.imageSupport[modelID]; supportKnown {
+		return supportsImages, true
+	}
+	supportsImages, supportKnown := catalog.imageSupport[resolvedModel]
+	return supportsImages, supportKnown
+}
+
+func snapshotDynamicCatalog(accountKey string, models []modelDef) *persistedModelCatalog {
+	if strings.TrimSpace(accountKey) == "" || len(models) == 0 {
+		return nil
+	}
+	dynamicCatalogsMu.RLock()
+	catalog, catalogExists := dynamicCatalogs[accountKey]
+	dynamicCatalogsMu.RUnlock()
+	if !catalogExists || len(catalog.baseWire) == 0 || len(catalog.families) == 0 {
+		return nil
+	}
+	return &persistedModelCatalog{
+		Models:    append([]modelDef(nil), models...),
+		BaseWire:  cloneStringMap(catalog.baseWire),
+		Families:  cloneNestedStringMap(catalog.families),
+		FetchedAt: time.Now().UTC(),
+	}
+}
+
+func restoreDynamicCatalog(accountKey string, catalog *persistedModelCatalog) []modelDef {
+	if strings.TrimSpace(accountKey) == "" || catalog == nil || len(catalog.Models) == 0 || len(catalog.BaseWire) == 0 {
+		return nil
+	}
+	storeDynamicCatalog(
+		accountKey,
+		cloneStringMap(catalog.BaseWire),
+		cloneNestedStringMap(catalog.Families),
+		catalog.Models,
+	)
+	return append([]modelDef(nil), catalog.Models...)
+}
+
+func modelCatalogNeedsRefresh(catalog *persistedModelCatalog) bool {
+	return catalog == nil || catalog.FetchedAt.IsZero() || time.Since(catalog.FetchedAt) >= modelCatalogRefreshInterval
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneNestedStringMap(source map[string]map[string]string) map[string]map[string]string {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]map[string]string, len(source))
+	for key, values := range source {
+		cloned[key] = cloneStringMap(values)
+	}
+	return cloned
 }
 
 // normalizeEffort maps an OpenAI reasoning_effort / thinking level to a tier key.
@@ -145,7 +247,7 @@ func fetchModelCatalogWithClient(ctx context.Context, client *http.Client, cfg p
 	if len(list) == 0 {
 		return nil
 	}
-	storeDynamicCatalog(cfg.sessionToken, baseWire, families)
+	storeDynamicCatalog(cfg.sessionToken, baseWire, families, list)
 	return list
 }
 
@@ -154,6 +256,10 @@ func fetchModelCatalogWithClient(ctx context.Context, client *http.Client, cfg p
 // Split out from fetchModelCatalog so the bucketing is unit-testable without a
 // live account.
 func buildCatalog(entries []modelEntry) (list []modelDef, baseWire map[string]string, families map[string]map[string]string) {
+	wireImageSupport := make(map[string]bool, len(entries))
+	for _, entry := range entries {
+		wireImageSupport[entry.wire] = entry.supportsImages
+	}
 	// Pass 1: learn each base family's default (featured) tier + context window.
 	// The featured entry is what the Devin picker shows by default — for GLM that
 	// is the 200K "High", not the 1M variant — so we treat its context as the
@@ -243,7 +349,13 @@ func buildCatalog(entries []modelEntry) (list []modelDef, baseWire map[string]st
 			continue
 		}
 		baseWire[key] = wire
-		list = append(list, modelDef{ID: key, Display: keyDisplay[key], Wire: wire})
+		list = append(list, modelDef{
+			ID:                key,
+			Display:           keyDisplay[key],
+			Wire:              wire,
+			SupportsImages:    wireImageSupport[wire],
+			ImageSupportKnown: true,
+		})
 	}
 	sort.Slice(list, func(firstIndex, secondIndex int) bool {
 		return list[firstIndex].ID < list[secondIndex].ID
@@ -307,6 +419,7 @@ func parseModelEntries(raw []byte) []modelEntry {
 type modelEntry struct {
 	display, wire, base string
 	featured            bool
+	supportsImages      bool
 	context             uint64 // f18 = context window length
 }
 
@@ -320,6 +433,8 @@ func parseModelEntry(b []byte) modelEntry {
 			break
 		}
 		switch {
+		case w == 0 && f == 5:
+			e.supportsImages = v == 1
 		case w == 0 && f == 11:
 			e.featured = v == 1
 		case w == 0 && f == 18:

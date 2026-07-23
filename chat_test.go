@@ -2,6 +2,22 @@ package main
 
 import "testing"
 
+func TestCompatibleToolDescriptionRewritesCursorAskQuestion(t *testing.T) {
+	originalDescription := "Collect structured answers from the user and wait for their responses before continuing."
+	compatibleDescription := compatibleToolDescription("AskQuestion", originalDescription)
+
+	if compatibleDescription == originalDescription {
+		t.Fatal("Cursor AskQuestion description was not rewritten")
+	}
+	if compatibleDescription == "" {
+		t.Fatal("Cursor AskQuestion description was removed")
+	}
+	safeShellDescription := "Execute a command in a shell session."
+	if unchangedDescription := compatibleToolDescription("Shell", safeShellDescription); unchangedDescription != safeShellDescription {
+		t.Fatalf("unrelated tool description changed to %q", unchangedDescription)
+	}
+}
+
 func TestParseResponseFramePreservesMultipleToolDeltas(t *testing.T) {
 	var firstTool pw
 	firstTool.str(1, "functions.read_file:0")

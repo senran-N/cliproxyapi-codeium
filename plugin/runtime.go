@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 // pluginName/Version/Author are surfaced to management clients and the registry.
 const (
 	pluginName    = "codeium"
-	pluginVersion = "0.5.0"
+	pluginVersion = "0.6.0"
 	pluginAuthor  = "senran-N"
 	pluginRepo    = "https://github.com/senran-N/cliproxyapi-codeium"
 )
@@ -44,6 +46,17 @@ type streamResult struct {
 type streamChunk struct {
 	Payload []byte `json:"Payload"`
 }
+
+type authModelRequest struct {
+	HostCallbackID string            `json:"host_callback_id"`
+	AuthID         string            `json:"AuthID"`
+	StorageJSON    []byte            `json:"StorageJSON"`
+	Metadata       map[string]any    `json:"Metadata"`
+	Attributes     map[string]string `json:"Attributes"`
+	Host           pluginHostConfig  `json:"Host"`
+}
+
+var modelCatalogRefreshes sync.Map
 
 // handleMethod dispatches a host RPC. On success it returns the method result
 // JSON; on failure it returns an error code + message.
@@ -195,14 +208,71 @@ func registerJSON() string {
 	return string(registrationJSON)
 }
 
-// modelsForAuth returns the stable fallback catalogue for one authenticated
-// account. Model discovery must not make a nested host HTTP callback while the
-// host is registering that account: native plugin hosts can serialize the
-// outer model.for_auth call, causing the nested callback to return an empty RPC
-// envelope. Requests may still pass exact upstream model identifiers through.
+// modelsForAuth restores a persisted account catalogue without doing network
+// work in the RPC. Some native hosts stop waiting for model.for_auth as soon as
+// their registration context ends, so a network-bound response can be discarded
+// even after discovery succeeds. Missing and stale catalogues are refreshed in
+// the background and saved through the host, which triggers account reloading.
 func modelsForAuth(request []byte) json.RawMessage {
-	_ = request
-	return json.RawMessage(modelsJSON(codeiumModels))
+	var modelRequest authModelRequest
+	if errDecode := json.Unmarshal(request, &modelRequest); errDecode != nil {
+		return json.RawMessage(modelsJSON(codeiumModels))
+	}
+	credentials, errCredentials := decodePersistedCredentials(modelRequest.StorageJSON)
+	if errCredentials != nil || strings.TrimSpace(credentials.SessionToken) == "" {
+		return json.RawMessage(modelsJSON(codeiumModels))
+	}
+
+	dynamicModels := restoreDynamicCatalog(credentials.SessionToken, credentials.ModelCatalog)
+	if modelCatalogNeedsRefresh(credentials.ModelCatalog) {
+		startAsyncModelCatalogRefresh(modelRequest, credentials)
+	}
+	if len(dynamicModels) == 0 {
+		return json.RawMessage(modelsJSON(codeiumModels))
+	}
+	return json.RawMessage(modelsJSON(dynamicModels))
+}
+
+func startAsyncModelCatalogRefresh(modelRequest authModelRequest, credentials persistedCredentials) {
+	accountKey := strings.TrimSpace(credentials.SessionToken)
+	authID := strings.TrimSpace(modelRequest.AuthID)
+	if accountKey == "" || authID == "" {
+		return
+	}
+	if _, refreshAlreadyRunning := modelCatalogRefreshes.LoadOrStore(accountKey, struct{}{}); refreshAlreadyRunning {
+		return
+	}
+
+	go func() {
+		defer modelCatalogRefreshes.Delete(accountKey)
+		directHTTPClient, errClient := buildDirectHTTPClient(modelRequest.Host.ProxyURL)
+		if errClient != nil {
+			return
+		}
+		refreshContext, cancelRefresh := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancelRefresh()
+		providerConfig := configFromAuthData(modelRequest.StorageJSON, modelRequest.Attributes, modelRequest.Metadata)
+		refreshPersistedModelCatalogWithConfig(refreshContext, directHTTPClient, &credentials, providerConfig)
+		if credentials.ModelCatalog == nil || len(credentials.ModelCatalog.Models) == 0 {
+			return
+		}
+
+		authFileName := authID + ".json"
+		var authLookup hostAuthGetResponse
+		if errLookup := invokeHostCallback(hostAuthGetMethod, hostAuthGetRequest{AuthIndex: authID}, &authLookup); errLookup == nil {
+			if candidateName := strings.TrimSpace(authLookup.Name); strings.HasSuffix(strings.ToLower(candidateName), ".json") {
+				authFileName = candidateName
+			}
+		}
+		updatedCredentialsJSON, errMarshal := json.Marshal(credentials)
+		if errMarshal != nil {
+			return
+		}
+		_ = invokeHostCallback(hostAuthSaveMethod, hostAuthSaveRequest{
+			Name: authFileName,
+			JSON: updatedCredentialsJSON,
+		}, nil)
+	}()
 }
 
 // modelsJSON renders a model list for model.static/for_auth.

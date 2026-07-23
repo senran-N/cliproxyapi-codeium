@@ -18,18 +18,26 @@ const (
 // ---- OpenAI request shapes (subset we consume) ----
 
 type oaiRequest struct {
-	Model           string       `json:"model"`
-	Messages        []oaiMessage `json:"messages"`
-	Tools           []oaiTool    `json:"tools"`
-	Stream          bool         `json:"stream"`
-	ReasoningEffort string       `json:"reasoning_effort"`
+	Model                  string          `json:"model"`
+	Messages               []oaiMessage    `json:"messages"`
+	Tools                  []oaiTool       `json:"tools"`
+	ToolChoice             json.RawMessage `json:"tool_choice"`
+	ParallelToolCalls      *bool           `json:"parallel_tool_calls"`
+	Stream                 bool            `json:"stream"`
+	ReasoningEffort        string          `json:"reasoning_effort"`
+	ResolvedToolChoice     string          `json:"-"`
+	LimitParallelToolCalls bool            `json:"-"`
+	ToolCompatibilityError string          `json:"-"`
 }
 
 type oaiMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"`
-	ToolCalls  []oaiToolCall   `json:"tool_calls"`
-	ToolCallID string          `json:"tool_call_id"`
+	Role            string              `json:"role"`
+	Content         json.RawMessage     `json:"content"`
+	ToolCalls       []oaiToolCall       `json:"tool_calls"`
+	ToolCallID      string              `json:"tool_call_id"`
+	PreparedText    string              `json:"-"`
+	ContentPrepared bool                `json:"-"`
+	Images          []codeiumImageInput `json:"-"`
 }
 
 type oaiToolCall struct {
@@ -52,27 +60,10 @@ type oaiTool struct {
 
 // contentString flattens OpenAI content (string or array of parts) to text.
 func (m oaiMessage) contentString() string {
-	if len(m.Content) == 0 {
-		return ""
+	if m.ContentPrepared {
+		return m.PreparedText
 	}
-	var s string
-	if json.Unmarshal(m.Content, &s) == nil {
-		return s
-	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(m.Content, &parts) == nil {
-		var b strings.Builder
-		for _, p := range parts {
-			if p.Text != "" {
-				b.WriteString(p.Text)
-			}
-		}
-		return b.String()
-	}
-	return ""
+	return compatibleMessageContent(m.Content)
 }
 
 // buildChatRequest converts an OpenAI chat completion request into a
@@ -97,6 +88,9 @@ func buildChatRequest(cfg providerConfig, jwt string, oai oaiRequest) ([]byte, s
 	if len(sysParts) > 0 {
 		system = strings.Join(sysParts, "\n\n")
 	}
+	if oai.LimitParallelToolCalls && len(oai.Tools) > 0 {
+		system = strings.TrimSpace(system + "\n\nCall at most one tool in this assistant turn.")
+	}
 
 	var req pw
 	req.msg(1, metadataForChat(cfg, jwt))
@@ -107,13 +101,13 @@ func buildChatRequest(cfg providerConfig, jwt string, oai oaiRequest) ([]byte, s
 		case "system", "developer":
 			continue
 		case "user":
-			req.msg(3, chatMessage(roleUser, "", m.contentString(), "", nil))
+			req.msg(3, chatMessage(roleUser, "", m.contentString(), "", nil, m.Images))
 		case "assistant":
-			req.msg(3, chatMessage(roleAssistant, "bot-"+uuid.NewString(), m.contentString(), "", m.ToolCalls))
+			req.msg(3, chatMessage(roleAssistant, "bot-"+uuid.NewString(), m.contentString(), "", m.ToolCalls, m.Images))
 		case "tool":
-			req.msg(3, chatMessage(roleTool, "", m.contentString(), m.ToolCallID, nil))
+			req.msg(3, chatMessage(roleTool, "", m.contentString(), m.ToolCallID, nil, m.Images))
 		default:
-			req.msg(3, chatMessage(roleUser, "", m.contentString(), "", nil))
+			req.msg(3, chatMessage(roleUser, "", m.contentString(), "", nil, m.Images))
 		}
 	}
 
@@ -131,10 +125,12 @@ func buildChatRequest(cfg providerConfig, jwt string, oai oaiRequest) ([]byte, s
 		req.msg(10, td.bytes())
 	}
 
-	// tool_choice = auto (f12 { f1: "auto" }).
-	if len(oai.Tools) > 0 {
+	// Tool choice is normalized before encoding. A selected function is reduced
+	// to a one-tool required request, which avoids relying on a provider-specific
+	// forced-function wire representation.
+	if len(oai.Tools) > 0 && oai.ResolvedToolChoice != "" {
 		var tc pw
-		tc.str(1, "auto")
+		tc.str(1, oai.ResolvedToolChoice)
 		req.msg(12, tc.bytes())
 	}
 
@@ -158,7 +154,14 @@ func buildChatRequest(cfg providerConfig, jwt string, oai oaiRequest) ([]byte, s
 }
 
 // chatMessage encodes a single ChatMessage sub-message.
-func chatMessage(role int, botID, content, toolCallID string, toolCalls []oaiToolCall) []byte {
+func chatMessage(
+	role int,
+	botID,
+	content,
+	toolCallID string,
+	toolCalls []oaiToolCall,
+	images []codeiumImageInput,
+) []byte {
 	var m pw
 	m.str(1, botID)
 	m.varintAlways(2, uint64(role))
@@ -167,7 +170,20 @@ func chatMessage(role int, botID, content, toolCallID string, toolCalls []oaiToo
 	for i, tc := range toolCalls {
 		m.bytesField(6, encodeToolCall(i, tc))
 	}
+	for _, image := range images {
+		m.msg(10, encodeImageData(image))
+	}
 	return m.bytes()
+}
+
+// encodeImageData writes exa.codeium_common_pb.ImageData:
+// f1 base64_data, f2 mime_type, f3 caption.
+func encodeImageData(image codeiumImageInput) []byte {
+	var imageMessage pw
+	imageMessage.str(1, image.Base64Data)
+	imageMessage.str(2, image.MIMEType)
+	imageMessage.str(3, image.Caption)
+	return imageMessage.bytes()
 }
 
 // encodeToolCall builds the nested tool-call message { f1 id, f2 name, f3 args }.

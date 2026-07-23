@@ -43,6 +43,9 @@ func accumulateToolDeltas(tools []*toolAcc, toolIndexes map[string]int, activeTo
 
 // openUpstream mints a JWT and opens the streaming GetChatMessage request.
 func openUpstream(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest) (*http.Response, error) {
+	if oai.ToolCompatibilityError != "" {
+		return nil, fmt.Errorf("codeium: invalid tool configuration: %s", oai.ToolCompatibilityError)
+	}
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -85,18 +88,53 @@ func openUpstream(ctx context.Context, client *http.Client, cfg providerConfig, 
 
 // executeNonStream drains the upstream stream into a single OpenAI completion.
 func executeNonStream(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest) ([]byte, error) {
-	resp, err := openUpstream(ctx, client, cfg, oai)
-	if err != nil {
-		return nil, err
+	if errSupport := validateRequestImageModelSupport(cfg.sessionToken, oai); errSupport != nil {
+		return nil, fmt.Errorf("codeium: invalid image input: %w", errSupport)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	imageCompatibleRequest, errImages := prepareImageCompatibleRequest(ctx, client, oai)
+	if errImages != nil {
+		return nil, fmt.Errorf("codeium: invalid image input: %w", errImages)
+	}
+	oai = imageCompatibleRequest
+	responseBody, errNormal := executeNonStreamAttempt(
+		ctx,
+		client,
+		cfg,
+		oai,
+		toolCompatibilityNormal,
+	)
+	if !isMCPConfigurationError(errNormal) || !hasToolCompatibilityContext(oai) {
+		return responseBody, errNormal
+	}
+	return executeNonStreamAttempt(
+		ctx,
+		client,
+		cfg,
+		oai,
+		toolCompatibilityFallback,
+	)
+}
+
+func executeNonStreamAttempt(
+	ctx context.Context,
+	client *http.Client,
+	cfg providerConfig,
+	oai oaiRequest,
+	compatibilityMode toolCompatibilityMode,
+) ([]byte, error) {
+	compatibleRequest, compatibility := prepareToolCompatibleRequest(oai, compatibilityMode)
+	response, errOpen := openUpstream(ctx, client, cfg, compatibleRequest)
+	if errOpen != nil {
+		return nil, errOpen
+	}
+	defer func() { _ = response.Body.Close() }()
 
 	var content, reasoning strings.Builder
 	var tools []*toolAcc
 	toolIndexes := map[string]int{}
 	activeToolIndex := -1
 	model := oai.Model
-	er := newEnvelopeReader(resp.Body)
+	er := newEnvelopeReader(response.Body)
 	for {
 		fr, errRead := er.read()
 		if errRead == io.EOF {
@@ -112,6 +150,9 @@ func executeNonStream(ctx context.Context, client *http.Client, cfg providerConf
 			continue
 		}
 		d := parseResponseFrame(fr.body)
+		for toolIndex := range d.tools {
+			d.tools[toolIndex].name = compatibility.restoreName(d.tools[toolIndex].name)
+		}
 		if d.model != "" {
 			model = d.model
 		}
@@ -140,11 +181,50 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 	if emit == nil {
 		return fmt.Errorf("codeium: stream emitter is nil")
 	}
-	resp, err := openUpstream(ctx, client, cfg, oai)
-	if err != nil {
-		return err
+	if errSupport := validateRequestImageModelSupport(cfg.sessionToken, oai); errSupport != nil {
+		return fmt.Errorf("codeium: invalid image input: %w", errSupport)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	imageCompatibleRequest, errImages := prepareImageCompatibleRequest(ctx, client, oai)
+	if errImages != nil {
+		return fmt.Errorf("codeium: invalid image input: %w", errImages)
+	}
+	oai = imageCompatibleRequest
+	emittedOutput, errNormal := executeStreamAttempt(
+		ctx,
+		client,
+		cfg,
+		oai,
+		toolCompatibilityNormal,
+		emit,
+	)
+	if emittedOutput || !isMCPConfigurationError(errNormal) || !hasToolCompatibilityContext(oai) {
+		return errNormal
+	}
+	_, errFallback := executeStreamAttempt(
+		ctx,
+		client,
+		cfg,
+		oai,
+		toolCompatibilityFallback,
+		emit,
+	)
+	return errFallback
+}
+
+func executeStreamAttempt(
+	ctx context.Context,
+	client *http.Client,
+	cfg providerConfig,
+	oai oaiRequest,
+	compatibilityMode toolCompatibilityMode,
+	emit func([]byte) error,
+) (bool, error) {
+	compatibleRequest, compatibility := prepareToolCompatibleRequest(oai, compatibilityMode)
+	response, errOpen := openUpstream(ctx, client, cfg, compatibleRequest)
+	if errOpen != nil {
+		return false, errOpen
+	}
+	defer func() { _ = response.Body.Close() }()
 
 	id := "chatcmpl-" + nowID()
 	model := oai.Model
@@ -159,29 +239,34 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 	toolIndexes := map[string]int{}
 	activeToolIndex := -1
 	sawTool := false
-	er := newEnvelopeReader(resp.Body)
+	emittedOutput := false
+	er := newEnvelopeReader(response.Body)
 	for {
 		fr, errRead := er.read()
 		if errRead == io.EOF {
 			break
 		}
 		if errRead != nil {
-			return errRead
+			return emittedOutput, errRead
 		}
 		if fr.end {
 			if te := trailerError(fr.body); te != nil {
-				return te
+				return emittedOutput, te
 			}
 			continue
 		}
 		d := parseResponseFrame(fr.body)
+		for toolIndex := range d.tools {
+			d.tools[toolIndex].name = compatibility.restoreName(d.tools[toolIndex].name)
+		}
 		if d.model != "" {
 			model = d.model
 		}
 		if d.content != "" || d.reasoning != "" {
 			if errEmit := emit(openAIStreamChunk(id, model, roleFor(), d.content, d.reasoning, "")); errEmit != nil {
-				return errEmit
+				return emittedOutput, errEmit
 			}
+			emittedOutput = true
 		}
 		for _, tool := range d.tools {
 			if tool.id != "" {
@@ -191,15 +276,17 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 					toolIndexes[tool.id] = toolIndex
 					sawTool = true
 					if errEmit := emit(openAIStreamToolChunk(id, model, roleFor(), toolIndex, tool.id, tool.name, "")); errEmit != nil {
-						return errEmit
+						return emittedOutput, errEmit
 					}
+					emittedOutput = true
 				}
 				activeToolIndex = toolIndex
 			}
 			if tool.args != "" && activeToolIndex >= 0 {
 				if errEmit := emit(openAIStreamToolChunk(id, model, "", activeToolIndex, "", "", tool.args)); errEmit != nil {
-					return errEmit
+					return emittedOutput, errEmit
 				}
+				emittedOutput = true
 			}
 		}
 	}
@@ -208,9 +295,13 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 		finish = "tool_calls"
 	}
 	if errEmit := emit(openAIStreamChunk(id, model, "", "", "", finish)); errEmit != nil {
-		return errEmit
+		return emittedOutput, errEmit
 	}
-	return emit([]byte("[DONE]"))
+	emittedOutput = true
+	if errEmit := emit([]byte("[DONE]")); errEmit != nil {
+		return emittedOutput, errEmit
+	}
+	return emittedOutput, nil
 }
 
 // trailerError inspects an end-of-stream trailer frame for a Connect error.

@@ -26,7 +26,7 @@ func TestFetchModelCatalogLive(t *testing.T) {
 	}
 	fmt.Printf("\n===== FETCHED %d MODELS =====\n", len(models))
 	for _, m := range models {
-		fmt.Printf("  %-34s -> %s\n", m.ID, m.Wire)
+		fmt.Printf("  %-34s images=%-5t -> %s\n", m.ID, m.SupportsImages, m.Wire)
 	}
 	fmt.Println("----- variant composition (base + effort) -----")
 	for _, id := range []string{"claude-opus-4.8", "gpt-5.6-sol", "glm-5.2"} {

@@ -71,43 +71,49 @@ func (e codeiumExecutor) HttpRequest(ctx context.Context, a *coreauth.Auth, req 
 // Execute performs a non-streaming completion by draining the upstream stream.
 func (e codeiumExecutor) Execute(ctx context.Context, a *coreauth.Auth, req clipexec.Request, opts clipexec.Options) (clipexec.Response, error) {
 	cfg := configFromAuth(a)
-	resp, err := e.upstream(ctx, a, cfg, opts, req.Model, req.Payload)
-	if err != nil {
-		return clipexec.Response{}, err
+	preparedRequest, client, errPrepare := prepareExecutorOpenAIRequest(
+		ctx,
+		a,
+		cfg,
+		opts,
+		req.Model,
+		req.Payload,
+	)
+	if errPrepare != nil {
+		return clipexec.Response{}, errPrepare
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var content, reasoning strings.Builder
-	var tools []*toolAcc
-	toolIndexes := map[string]int{}
-	activeToolIndex := -1
+	compatibilityModes := []toolCompatibilityMode{
+		toolCompatibilityNormal,
+		toolCompatibilityFallback,
+	}
+	var body []byte
 	model := req.Model
-	er := newEnvelopeReader(resp.Body)
-	for {
-		fr, errRead := er.read()
-		if errRead == io.EOF {
-			break
+	for attemptIndex, compatibilityMode := range compatibilityModes {
+		response, compatibility, errOpen := e.upstream(
+			ctx,
+			cfg,
+			client,
+			preparedRequest,
+			compatibilityMode,
+		)
+		if errOpen != nil {
+			return clipexec.Response{}, errOpen
 		}
-		if errRead != nil {
-			return clipexec.Response{}, errRead
-		}
-		if fr.end {
-			if e := trailerError(fr.body); e != nil {
-				return clipexec.Response{}, e
-			}
+
+		var errDrain error
+		body, model, errDrain = drainNonStreamResponse(response.Body, req.Model, compatibility)
+		_ = response.Body.Close()
+		shouldRetry := attemptIndex == 0 &&
+			len(compatibility.originalNameByCompatibleName) > 0 &&
+			isMCPConfigurationError(errDrain)
+		if shouldRetry {
 			continue
 		}
-		d := parseResponseFrame(fr.body)
-		if d.model != "" {
-			model = d.model
+		if errDrain != nil {
+			return clipexec.Response{}, errDrain
 		}
-		content.WriteString(d.content)
-		reasoning.WriteString(d.reasoning)
-		tools, activeToolIndex = accumulateToolDeltas(tools, toolIndexes, activeToolIndex, d.tools)
+		break
 	}
-
-	out := openAICompletion(model, content.String(), reasoning.String(), tools)
-	body, _ := json.Marshal(out)
 
 	// Translate the OpenAI response into the client's protocol (identity for
 	// /v1/chat/completions).
@@ -118,27 +124,86 @@ func (e codeiumExecutor) Execute(ctx context.Context, a *coreauth.Auth, req clip
 	return clipexec.Response{Payload: body}, nil
 }
 
+func drainNonStreamResponse(
+	responseBody io.Reader,
+	requestedModel string,
+	compatibility toolCompatibility,
+) ([]byte, string, error) {
+	var content, reasoning strings.Builder
+	var tools []*toolAcc
+	toolIndexes := map[string]int{}
+	activeToolIndex := -1
+	model := requestedModel
+	envelopeReader := newEnvelopeReader(responseBody)
+	for {
+		frame, errRead := envelopeReader.read()
+		if errRead == io.EOF {
+			break
+		}
+		if errRead != nil {
+			return nil, model, errRead
+		}
+		if frame.end {
+			if errTrailer := trailerError(frame.body); errTrailer != nil {
+				return nil, model, errTrailer
+			}
+			continue
+		}
+		delta := parseResponseFrame(frame.body)
+		for toolIndex := range delta.tools {
+			delta.tools[toolIndex].name = compatibility.restoreName(delta.tools[toolIndex].name)
+		}
+		if delta.model != "" {
+			model = delta.model
+		}
+		content.WriteString(delta.content)
+		reasoning.WriteString(delta.reasoning)
+		tools, activeToolIndex = accumulateToolDeltas(tools, toolIndexes, activeToolIndex, delta.tools)
+	}
+
+	completion := openAICompletion(model, content.String(), reasoning.String(), tools)
+	completionJSON, errMarshal := json.Marshal(completion)
+	return completionJSON, model, errMarshal
+}
+
 // ExecuteStream performs a streaming completion, emitting OpenAI SSE chunks.
 func (e codeiumExecutor) ExecuteStream(ctx context.Context, a *coreauth.Auth, req clipexec.Request, opts clipexec.Options) (*clipexec.StreamResult, error) {
 	cfg := configFromAuth(a)
-	resp, err := e.upstream(ctx, a, cfg, opts, req.Model, req.Payload)
-	if err != nil {
-		return nil, err
+	preparedRequest, client, errPrepare := prepareExecutorOpenAIRequest(
+		ctx,
+		a,
+		cfg,
+		opts,
+		req.Model,
+		req.Payload,
+	)
+	if errPrepare != nil {
+		return nil, errPrepare
 	}
+	response, compatibility, errOpen := e.upstream(
+		ctx,
+		cfg,
+		client,
+		preparedRequest,
+		toolCompatibilityNormal,
+	)
+	if errOpen != nil {
+		return nil, errOpen
+	}
+	responseHeaders := response.Header.Clone()
 
-	rf := responseFormat(opts)
-	translate := rf != sdktr.FormatOpenAI
+	requestedResponseFormat := responseFormat(opts)
+	translateResponse := requestedResponseFormat != sdktr.FormatOpenAI
 
-	ch := make(chan clipexec.StreamChunk)
+	streamChunks := make(chan clipexec.StreamChunk)
 	go func() {
-		defer close(ch)
-		defer func() { _ = resp.Body.Close() }()
+		defer close(streamChunks)
 
 		// send delivers a chunk, but aborts if the caller cancelled (client
 		// disconnect) so the goroutine never leaks blocking on the channel.
-		send := func(c clipexec.StreamChunk) bool {
+		send := func(chunk clipexec.StreamChunk) bool {
 			select {
-			case ch <- c:
+			case streamChunks <- chunk:
 				return true
 			case <-ctx.Done():
 				return false
@@ -147,98 +212,168 @@ func (e codeiumExecutor) ExecuteStream(ctx context.Context, a *coreauth.Auth, re
 
 		// emit forwards one OpenAI SSE chunk, translating it into the client's
 		// protocol when needed (stateful across the stream via param).
-		var param any
+		var translationState any
 		emit := func(openaiChunk []byte) bool {
-			if !translate {
+			if !translateResponse {
 				return send(clipexec.StreamChunk{Payload: openaiChunk})
 			}
-			for _, out := range sdktr.TranslateStream(ctx, sdktr.FormatOpenAI, rf, req.Model, req.Payload, req.Payload, openaiChunk, &param) {
-				if !send(clipexec.StreamChunk{Payload: out}) {
+			translatedChunks := sdktr.TranslateStream(
+				ctx,
+				sdktr.FormatOpenAI,
+				requestedResponseFormat,
+				req.Model,
+				req.Payload,
+				req.Payload,
+				openaiChunk,
+				&translationState,
+			)
+			for _, translatedChunk := range translatedChunks {
+				if !send(clipexec.StreamChunk{Payload: translatedChunk}) {
 					return false
 				}
 			}
 			return true
 		}
 
-		id := "chatcmpl-" + nowID()
-		model := req.Model
-		er := newEnvelopeReader(resp.Body)
-		first := true
-		roleFor := func() string {
-			if first {
-				first = false
-				return "assistant"
-			}
-			return ""
-		}
-		toolIndexes := map[string]int{}
-		activeToolIndex := -1
-		sawTool := false
-		for {
-			fr, errRead := er.read()
-			if errRead == io.EOF {
-				break
-			}
-			if errRead != nil {
-				send(clipexec.StreamChunk{Err: errRead})
-				return
-			}
-			if fr.end {
-				if e := trailerError(fr.body); e != nil {
-					send(clipexec.StreamChunk{Err: e})
+		currentResponse := response
+		currentCompatibility := compatibility
+		for attemptIndex := 0; attemptIndex < 2; attemptIndex++ {
+			emittedOutput, errForward := forwardSDKStreamResponse(
+				currentResponse.Body,
+				req.Model,
+				currentCompatibility,
+				emit,
+			)
+			_ = currentResponse.Body.Close()
+
+			shouldRetry := attemptIndex == 0 &&
+				!emittedOutput &&
+				len(currentCompatibility.originalNameByCompatibleName) > 0 &&
+				isMCPConfigurationError(errForward)
+			if shouldRetry {
+				translationState = nil
+				var errRetry error
+				currentResponse, currentCompatibility, errRetry = e.upstream(
+					ctx,
+					cfg,
+					client,
+					preparedRequest,
+					toolCompatibilityFallback,
+				)
+				if errRetry != nil {
+					send(clipexec.StreamChunk{Err: errRetry})
 					return
 				}
 				continue
 			}
-			d := parseResponseFrame(fr.body)
-			if d.model != "" {
-				model = d.model
+			if errForward != nil {
+				send(clipexec.StreamChunk{Err: errForward})
 			}
-			if d.content != "" || d.reasoning != "" {
-				if !emit(sseChunk(id, model, roleFor(), d.content, d.reasoning, "")) {
-					return
-				}
-			}
-			for _, tool := range d.tools {
-				if tool.id != "" {
-					toolIndex, alreadyStarted := toolIndexes[tool.id]
-					if !alreadyStarted {
-						toolIndex = len(toolIndexes)
-						toolIndexes[tool.id] = toolIndex
-						sawTool = true
-						if !emit(sseToolChunk(id, model, roleFor(), toolIndex, tool.id, tool.name, "")) {
-							return
-						}
-					}
-					activeToolIndex = toolIndex
-				}
-				if tool.args != "" && activeToolIndex >= 0 {
-					if !emit(sseToolChunk(id, model, "", activeToolIndex, "", "", tool.args)) {
-						return
-					}
-				}
-			}
-		}
-		// finish + DONE
-		finish := "stop"
-		if sawTool {
-			finish = "tool_calls"
-		}
-		if !emit(sseChunk(id, model, "", "", "", finish)) {
 			return
 		}
-		emit([]byte("data: [DONE]\n\n"))
 	}()
 
-	return &clipexec.StreamResult{Chunks: ch, Headers: resp.Header}, nil
+	return &clipexec.StreamResult{Chunks: streamChunks, Headers: responseHeaders}, nil
 }
 
-// upstream builds and sends the GetChatMessage Connect request.
-func (e codeiumExecutor) upstream(ctx context.Context, a *coreauth.Auth, cfg providerConfig, opts clipexec.Options, model string, rawPayload []byte) (*http.Response, error) {
+func forwardSDKStreamResponse(
+	responseBody io.Reader,
+	requestedModel string,
+	compatibility toolCompatibility,
+	emit func([]byte) bool,
+) (bool, error) {
+	completionID := "chatcmpl-" + nowID()
+	model := requestedModel
+	firstChunk := true
+	roleForNextChunk := func() string {
+		if firstChunk {
+			firstChunk = false
+			return "assistant"
+		}
+		return ""
+	}
+	toolIndexes := map[string]int{}
+	activeToolIndex := -1
+	sawTool := false
+	emittedOutput := false
+	envelopeReader := newEnvelopeReader(responseBody)
+	for {
+		frame, errRead := envelopeReader.read()
+		if errRead == io.EOF {
+			break
+		}
+		if errRead != nil {
+			return emittedOutput, errRead
+		}
+		if frame.end {
+			if errTrailer := trailerError(frame.body); errTrailer != nil {
+				return emittedOutput, errTrailer
+			}
+			continue
+		}
+
+		delta := parseResponseFrame(frame.body)
+		for toolIndex := range delta.tools {
+			delta.tools[toolIndex].name = compatibility.restoreName(delta.tools[toolIndex].name)
+		}
+		if delta.model != "" {
+			model = delta.model
+		}
+		if delta.content != "" || delta.reasoning != "" {
+			if !emit(sseChunk(completionID, model, roleForNextChunk(), delta.content, delta.reasoning, "")) {
+				return emittedOutput, context.Canceled
+			}
+			emittedOutput = true
+		}
+		for _, tool := range delta.tools {
+			if tool.id != "" {
+				toolIndex, alreadyStarted := toolIndexes[tool.id]
+				if !alreadyStarted {
+					toolIndex = len(toolIndexes)
+					toolIndexes[tool.id] = toolIndex
+					sawTool = true
+					if !emit(sseToolChunk(completionID, model, roleForNextChunk(), toolIndex, tool.id, tool.name, "")) {
+						return emittedOutput, context.Canceled
+					}
+					emittedOutput = true
+				}
+				activeToolIndex = toolIndex
+			}
+			if tool.args != "" && activeToolIndex >= 0 {
+				if !emit(sseToolChunk(completionID, model, "", activeToolIndex, "", "", tool.args)) {
+					return emittedOutput, context.Canceled
+				}
+				emittedOutput = true
+			}
+		}
+	}
+
+	finishReason := "stop"
+	if sawTool {
+		finishReason = "tool_calls"
+	}
+	if !emit(sseChunk(completionID, model, "", "", "", finishReason)) {
+		return emittedOutput, context.Canceled
+	}
+	emittedOutput = true
+	if !emit([]byte("data: [DONE]\n\n")) {
+		return emittedOutput, context.Canceled
+	}
+	return emittedOutput, nil
+}
+
+func prepareExecutorOpenAIRequest(
+	ctx context.Context,
+	a *coreauth.Auth,
+	cfg providerConfig,
+	opts clipexec.Options,
+	model string,
+	rawPayload []byte,
+) (oaiRequest, *http.Client, error) {
 	payload := inboundToOpenAI(opts, model, rawPayload)
 	var oai oaiRequest
 	if err := json.Unmarshal(payload, &oai); err != nil {
-		return nil, fmt.Errorf("codeium: invalid request payload: %w", err)
+		return oaiRequest{}, nil, fmt.Errorf("codeium: invalid request payload: %w", err)
 	}
 	// The client's reasoning effort (used to compose thinking variants) may arrive
 	// in the payload or in the host's execution metadata.
@@ -248,9 +383,29 @@ func (e codeiumExecutor) upstream(ctx context.Context, a *coreauth.Auth, cfg pro
 		}
 	}
 	client := buildHTTPClient(a)
+	if errSupport := validateRequestImageModelSupport(cfg.sessionToken, oai); errSupport != nil {
+		return oaiRequest{}, nil, fmt.Errorf("codeium: invalid image input: %w", errSupport)
+	}
+	imageCompatibleRequest, errImages := prepareImageCompatibleRequest(ctx, client, oai)
+	if errImages != nil {
+		return oaiRequest{}, nil, fmt.Errorf("codeium: invalid image input: %w", errImages)
+	}
+	return imageCompatibleRequest, client, nil
+}
+
+// upstream builds and sends one GetChatMessage Connect request. Multimodal
+// content is prepared before the retry loop so a remote image is downloaded at
+// most once for one downstream request.
+func (e codeiumExecutor) upstream(
+	ctx context.Context,
+	cfg providerConfig,
+	client *http.Client,
+	oai oaiRequest,
+	compatibilityMode toolCompatibilityMode,
+) (*http.Response, toolCompatibility, error) {
 	entry, err := getValidJWT(ctx, client, cfg)
 	if err != nil {
-		return nil, err
+		return nil, toolCompatibility{}, err
 	}
 	// Fill account identifiers from the JWT when not provided in config.
 	if cfg.teamID == "" {
@@ -259,16 +414,23 @@ func (e codeiumExecutor) upstream(ctx context.Context, a *coreauth.Auth, cfg pro
 	if cfg.userID == "" {
 		cfg.userID = entry.userID
 	}
-	msg, _ := buildChatRequest(cfg, entry.token, oai)
+	compatibleRequest, compatibility := prepareToolCompatibleRequest(oai, compatibilityMode)
+	if compatibleRequest.ToolCompatibilityError != "" {
+		return nil, compatibility, fmt.Errorf(
+			"codeium: invalid tool configuration: %s",
+			compatibleRequest.ToolCompatibilityError,
+		)
+	}
+	msg, _ := buildChatRequest(cfg, entry.token, compatibleRequest)
 	env, err := encodeEnvelope(msg, true)
 	if err != nil {
-		return nil, err
+		return nil, compatibility, err
 	}
 
 	url := strings.TrimRight(cfg.endpoint, "/") + "/exa.api_server_pb.ApiServerService/GetChatMessage"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(env))
 	if err != nil {
-		return nil, err
+		return nil, compatibility, err
 	}
 	httpReq.Header.Set("Content-Type", "application/connect+proto")
 	httpReq.Header.Set("Connect-Protocol-Version", "1")
@@ -278,14 +440,14 @@ func (e codeiumExecutor) upstream(ctx context.Context, a *coreauth.Auth, cfg pro
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, compatibility, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		return nil, &statusErr{code: resp.StatusCode, msg: fmt.Sprintf("GetChatMessage HTTP %d: %s", resp.StatusCode, truncate(raw, 300))}
+		return nil, compatibility, &statusErr{code: resp.StatusCode, msg: fmt.Sprintf("GetChatMessage HTTP %d: %s", resp.StatusCode, truncate(raw, 300))}
 	}
-	return resp, nil
+	return resp, compatibility, nil
 }
 
 // trailerError inspects an end-of-stream trailer frame for a Connect error.

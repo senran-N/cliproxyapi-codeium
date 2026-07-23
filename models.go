@@ -4,9 +4,11 @@ package main
 // /v1/models advertises) to the upstream wire value placed in GetChatMessage
 // field 21.
 type modelDef struct {
-	ID      string // friendly id (client-facing)
-	Display string
-	Wire    string // upstream f21 wire id
+	ID                string // friendly id (client-facing)
+	Display           string
+	Wire              string // upstream f21 wire id
+	SupportsImages    bool
+	ImageSupportKnown bool
 }
 
 // codeiumModels is only a minimal fallback used when the live model fetch fails.
@@ -15,8 +17,8 @@ type modelDef struct {
 // so no volatile model names are hardcoded here. The SWE ids are stable and
 // always available regardless of account entitlements.
 var codeiumModels = []modelDef{
-	{"swe-1-7", "SWE-1.7", "swe-1-7"},
-	{"swe-1-6", "SWE-1.6", "swe-1-6"},
+	{ID: "swe-1-7", Display: "SWE-1.7", Wire: "swe-1-7"},
+	{ID: "swe-1-6", Display: "SWE-1.6", Wire: "swe-1-6"},
 }
 
 // resolveModelWire maps a client-supplied model id to its upstream wire value.

@@ -16,6 +16,69 @@ including multi-turn agent flows (assistant tool call → tool result → answer
 The executor speaks OpenAI chat internally; the SDK's built-in translators bridge
 the Anthropic / Responses protocols in and out.
 
+### Image input
+
+Multimodal requests forward images through Codeium's native `ImageData` message
+rather than converting them to prompt placeholders. Supported inputs include:
+
+- OpenAI `image_url` content parts with a base64 data URL or an HTTPS URL;
+- OpenAI Responses-style `input_image` content parts;
+- Anthropic base64 image sources after CLIProxyAPI translates the request;
+- MCP tool-result parts shaped as `{"type":"image","mimeType":"...","data":"..."}`.
+
+PNG, JPEG, GIF, and WebP are accepted. Each image is limited to 10 MiB, each
+request to 20 images and 20 MiB of decoded image data. Remote URLs must use
+HTTPS, resolve only to public addresses, follow at most five validated
+redirects, and complete within 15 seconds. Invalid or unsupported image input
+returns an explicit request error instead of silently dropping the image.
+Remote image downloads use a dedicated direct connection with DNS-pinned public
+addresses; they intentionally do not use the host proxy, which prevents a proxy
+resolver from bypassing the private-address checks.
+When the live model catalogue identifies a selected model as text-only, the
+provider rejects the image request before contacting the chat backend. Unknown
+raw model ids are still passed through for forward compatibility.
+
+```bash
+curl http://localhost:8317/v1/chat/completions \
+  -H "Authorization: Bearer sk-local-devin-proxy" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus-4.8",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+      ]
+    }]
+  }'
+```
+
+### Cursor and MCP tool compatibility
+
+Cursor MCP tools arrive as OpenAI function tools. Before forwarding them, both
+provider forms apply the same compatibility layer:
+
+- tool names are normalized to Codeium-safe function identifiers and restored
+  in streamed and non-streamed responses;
+- descriptions that trigger Codeium's MCP policy false positives are rewritten
+  without changing the tool schema;
+- JSON Schema metadata, nullable types, constants, local references, and nested
+  schema containers are normalized while preserving argument constraints;
+- `tool_choice` supports `auto`, `none`, `required`, and a selected function;
+  `parallel_tool_calls: false` is forwarded as a best-effort single-call
+  instruction;
+- structured tool results are converted to predictable text; image parts are
+  forwarded as native image data, while unsupported audio remains a bounded
+  placeholder rather than being copied as base64 prompt text;
+- an MCP configuration rejection before any output triggers one conservative
+  retry with simplified descriptions and schemas.
+
+The layer cannot override an explicit Codeium server-side policy denial, and
+non-function MCP features such as resources, prompts, sampling, or elicitation
+are not independent model tools unless the client first exposes them as
+function calls.
+
 ## Install as a CLIProxyAPI plugin (marketplace)
 
 This repo ships **two forms** of the provider:
@@ -116,6 +179,7 @@ field numbers were reverse-engineered from captured traffic.
 | `metadata.go` | shared `ClientMetadata` message (auth + chat variants) |
 | `auth.go` | `GetUserJwt` refresh + JWT cache (keyed by session token, refreshes before `exp`) |
 | `chat.go` | OpenAI ⇄ `GetChatMessage` request/response translation |
+| `image_compat.go` | multimodal content parsing, validation, remote fetch, and image encoding preparation |
 | `executor.go` | SDK `Executor` (Execute / ExecuteStream) + OpenAI output |
 | `models.go` | model catalogue for `/v1/models` |
 | `main.go` | SDK wiring (builder, translator, model registry) |
@@ -189,6 +253,9 @@ content:   "pong"
 ```
 
 - **Auth + chat + streaming** — working end-to-end. ✅
+- **Image understanding** — OpenAI data URLs and Anthropic base64 images are
+  forwarded through native `ImageData` and verified live with a vision-capable
+  Claude model. ✅
 - **Premium models work** — Claude Opus/Sonnet/Haiku 4.5, GPT-5.2, Gemini 3
   Flash all verified returning content on a standard Devin Pro account. ✅
 - **Fingerprints** — generated locally, no hardcoded machine values; accepted by
