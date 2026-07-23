@@ -121,16 +121,10 @@ func startLogin(requestJSON []byte) (json.RawMessage, string, string) {
 	if errDecode := json.Unmarshal(requestJSON, &request); errDecode != nil {
 		return nil, "invalid_request", "decode auth login request: " + errDecode.Error()
 	}
-	callbackURL, errCallbackURL := url.Parse(strings.TrimSpace(request.BaseURL))
-	if errCallbackURL != nil || callbackURL.Scheme == "" || callbackURL.Host == "" {
-		return nil, "invalid_request", "Codeium login requires a valid CPA callback URL"
-	}
 
 	state := uuid.NewString()
 	helperURL := &url.URL{
-		Scheme: callbackURL.Scheme,
-		Host:   callbackURL.Host,
-		Path:   "/v0/resource/plugins/" + pluginName + "/login",
+		Path: "/v0/resource/plugins/" + pluginName + "/login",
 	}
 	helperQuery := helperURL.Query()
 	helperQuery.Set("state", state)

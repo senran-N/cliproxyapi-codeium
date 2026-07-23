@@ -52,7 +52,7 @@ func TestParseAuthRecognizesCodeiumCredentialFile(t *testing.T) {
 	}
 }
 
-func TestStartLoginReturnsCPAResourceURL(t *testing.T) {
+func TestStartLoginReturnsRelativeCPAResourceURL(t *testing.T) {
 	requestJSON, errMarshal := json.Marshal(authLoginStartRequest{BaseURL: "http://127.0.0.1:8321/v0/management/oauth-callback"})
 	if errMarshal != nil {
 		t.Fatalf("marshal start request: %v", errMarshal)
@@ -69,8 +69,11 @@ func TestStartLoginReturnsCPAResourceURL(t *testing.T) {
 	if errDecode := json.Unmarshal(result, &response); errDecode != nil {
 		t.Fatalf("decode start response: %v", errDecode)
 	}
-	if !strings.HasPrefix(response.URL, "http://127.0.0.1:8321/v0/resource/plugins/codeium/login?state=") || response.State == "" {
+	if !strings.HasPrefix(response.URL, "/v0/resource/plugins/codeium/login?state=") || response.State == "" {
 		t.Fatalf("unexpected login start response: %+v", response)
+	}
+	if strings.Contains(response.URL, "127.0.0.1") {
+		t.Fatalf("remote login URL must not use CPA's loopback callback host: %q", response.URL)
 	}
 }
 
