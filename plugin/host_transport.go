@@ -41,9 +41,9 @@ type hostHTTPRequest struct {
 }
 
 type hostHTTPResponse struct {
-	StatusCode int         `json:"status_code"`
-	Headers    http.Header `json:"headers"`
-	Body       []byte      `json:"body"`
+	StatusCode int         `json:"StatusCode"`
+	Headers    http.Header `json:"Headers"`
+	Body       []byte      `json:"Body"`
 }
 
 type hostHTTPStreamResponse struct {

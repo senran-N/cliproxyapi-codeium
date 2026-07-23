@@ -133,9 +133,9 @@ func executeStream(ctx context.Context, client *http.Client, cfg providerConfig,
 	return chunks, err
 }
 
-// executeStreamTo forwards each translated SSE chunk as soon as the upstream
-// frame arrives. Dynamic-library execution uses this to avoid buffering the
-// complete model response inside the plugin.
+// executeStreamTo forwards each translated OpenAI chunk as soon as the upstream
+// frame arrives. The CLIProxyAPI HTTP handler adds protocol framing when it
+// writes executor chunks to the downstream client.
 func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfig, oai oaiRequest, emit func([]byte) error) error {
 	if emit == nil {
 		return fmt.Errorf("codeium: stream emitter is nil")
@@ -179,7 +179,7 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 			model = d.model
 		}
 		if d.content != "" || d.reasoning != "" {
-			if errEmit := emit(sseChunk(id, model, roleFor(), d.content, d.reasoning, "")); errEmit != nil {
+			if errEmit := emit(openAIStreamChunk(id, model, roleFor(), d.content, d.reasoning, "")); errEmit != nil {
 				return errEmit
 			}
 		}
@@ -190,14 +190,14 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 					toolIndex = len(toolIndexes)
 					toolIndexes[tool.id] = toolIndex
 					sawTool = true
-					if errEmit := emit(sseToolChunk(id, model, roleFor(), toolIndex, tool.id, tool.name, "")); errEmit != nil {
+					if errEmit := emit(openAIStreamToolChunk(id, model, roleFor(), toolIndex, tool.id, tool.name, "")); errEmit != nil {
 						return errEmit
 					}
 				}
 				activeToolIndex = toolIndex
 			}
 			if tool.args != "" && activeToolIndex >= 0 {
-				if errEmit := emit(sseToolChunk(id, model, "", activeToolIndex, "", "", tool.args)); errEmit != nil {
+				if errEmit := emit(openAIStreamToolChunk(id, model, "", activeToolIndex, "", "", tool.args)); errEmit != nil {
 					return errEmit
 				}
 			}
@@ -207,10 +207,10 @@ func executeStreamTo(ctx context.Context, client *http.Client, cfg providerConfi
 	if sawTool {
 		finish = "tool_calls"
 	}
-	if errEmit := emit(sseChunk(id, model, "", "", "", finish)); errEmit != nil {
+	if errEmit := emit(openAIStreamChunk(id, model, "", "", "", finish)); errEmit != nil {
 		return errEmit
 	}
-	return emit([]byte("data: [DONE]\n\n"))
+	return emit([]byte("[DONE]"))
 }
 
 // trailerError inspects an end-of-stream trailer frame for a Connect error.
@@ -265,7 +265,9 @@ func openAICompletion(model, content, reasoning string, tools []*toolAcc) map[st
 	}
 }
 
-func sseChunk(id, model, role, content, reasoning, finish string) []byte {
+// openAIStreamChunk returns one raw OpenAI chunk. CLIProxyAPI owns the client
+// HTTP response and adds the SSE "data:" framing around every executor chunk.
+func openAIStreamChunk(id, model, role, content, reasoning, finish string) []byte {
 	delta := map[string]any{}
 	if role != "" {
 		delta["role"] = role
@@ -290,10 +292,10 @@ func sseChunk(id, model, role, content, reasoning, finish string) []byte {
 		"choices": []map[string]any{choice},
 	}
 	b, _ := json.Marshal(obj)
-	return append(append([]byte("data: "), b...), '\n', '\n')
+	return b
 }
 
-func sseToolChunk(id, model, role string, index int, tcID, tcName, argsDelta string) []byte {
+func openAIStreamToolChunk(id, model, role string, index int, tcID, tcName, argsDelta string) []byte {
 	fn := map[string]any{}
 	if tcName != "" {
 		fn["name"] = tcName
@@ -318,7 +320,7 @@ func sseToolChunk(id, model, role string, index int, tcID, tcName, argsDelta str
 		"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": nil}},
 	}
 	b, _ := json.Marshal(obj)
-	return append(append([]byte("data: "), b...), '\n', '\n')
+	return b
 }
 
 func nowID() string {

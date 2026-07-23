@@ -1,5 +1,6 @@
 // Command plugin builds the Codeium/Devin provider as a CLIProxyAPI C-ABI
-// dynamic-library plugin (executor + model_provider capabilities).
+// dynamic-library plugin (auth provider, executor, model provider, and
+// management resource capabilities).
 //
 // Build (needs a C toolchain / cgo):
 //

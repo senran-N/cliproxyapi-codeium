@@ -5,13 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-	"time"
 )
 
 // pluginName/Version/Author are surfaced to management clients and the registry.
 const (
 	pluginName    = "codeium"
-	pluginVersion = "0.4.0"
+	pluginVersion = "0.5.0"
 	pluginAuthor  = "senran-N"
 	pluginRepo    = "https://github.com/senran-N/cliproxyapi-codeium"
 )
@@ -27,6 +26,7 @@ type executorRequest struct {
 	OriginalRequest []byte
 	SourceFormat    string
 	Metadata        map[string]any
+	StorageJSON     []byte
 	AuthMetadata    map[string]any
 	AuthAttributes  map[string]string
 }
@@ -51,6 +51,20 @@ func handleMethod(method string, request []byte) (result json.RawMessage, code, 
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
 		return json.RawMessage(registerJSON()), "", ""
+	case "auth.identifier":
+		return json.RawMessage(`{"identifier":"` + providerKey + `"}`), "", ""
+	case "auth.parse":
+		return parseAuth(request)
+	case "auth.login.start":
+		return startLogin(request)
+	case "auth.login.poll":
+		return pollLogin(request)
+	case "auth.refresh":
+		return refreshAuth(request)
+	case "management.register":
+		return json.RawMessage(`{"resources":[{"path":"/login","menu":"Codeium Login","description":"Complete Codeium authentication"}]}`), "", ""
+	case "management.handle":
+		return handleManagement(request)
 	case "executor.identifier":
 		return json.RawMessage(`{"identifier":"` + providerKey + `"}`), "", ""
 	case "model.static":
@@ -75,7 +89,7 @@ func runExecute(request []byte, stream bool) (json.RawMessage, string, string) {
 	if err := json.Unmarshal(request, &executionRequest); err != nil {
 		return nil, "invalid_request", "decode executor request: " + err.Error()
 	}
-	providerConfig := configFromMaps(executionRequest.AuthAttributes, executionRequest.AuthMetadata)
+	providerConfig := configFromAuthData(executionRequest.StorageJSON, executionRequest.AuthAttributes, executionRequest.AuthMetadata)
 	payload := executionRequest.Payload
 	if len(payload) == 0 {
 		payload = executionRequest.OriginalRequest
@@ -165,10 +179,12 @@ func registerJSON() string {
 		"ConfigFields":     []any{},
 	}
 	capabilities := map[string]any{
+		"auth_provider":           true,
 		"executor":                true,
 		"executor_model_scope":    "both",
 		"executor_input_formats":  []string{"chat-completions"},
 		"executor_output_formats": []string{"chat-completions"},
+		"management_api":          true,
 		"model_provider":          true,
 	}
 	registrationJSON, _ := json.Marshal(map[string]any{
@@ -179,23 +195,14 @@ func registerJSON() string {
 	return string(registrationJSON)
 }
 
-// modelsForAuth returns the account's live model catalogue, fetched from the
-// backend using the auth's session token, falling back to the static list.
+// modelsForAuth returns the stable fallback catalogue for one authenticated
+// account. Model discovery must not make a nested host HTTP callback while the
+// host is registering that account: native plugin hosts can serialize the
+// outer model.for_auth call, causing the nested callback to return an empty RPC
+// envelope. Requests may still pass exact upstream model identifiers through.
 func modelsForAuth(request []byte) json.RawMessage {
-	var authRequest struct {
-		HostCallbackID string            `json:"host_callback_id"`
-		Metadata       map[string]any    `json:"Metadata"`
-		Attributes     map[string]string `json:"Attributes"`
-	}
-	_ = json.Unmarshal(request, &authRequest)
-	providerConfig := configFromMaps(authRequest.Attributes, authRequest.Metadata)
-	fetchContext, cancelFetch := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancelFetch()
-	models := fetchModelCatalogWithClient(fetchContext, buildPluginHTTPClient(authRequest.HostCallbackID), providerConfig)
-	if len(models) == 0 {
-		models = codeiumModels
-	}
-	return json.RawMessage(modelsJSON(models))
+	_ = request
+	return json.RawMessage(modelsJSON(codeiumModels))
 }
 
 // modelsJSON renders a model list for model.static/for_auth.

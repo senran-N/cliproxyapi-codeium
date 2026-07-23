@@ -18,15 +18,51 @@ func TestHandleMethodReturnsPluginRegistration(t *testing.T) {
 			Version string `json:"Version"`
 		} `json:"metadata"`
 		Capabilities struct {
+			AuthProvider  bool `json:"auth_provider"`
 			Executor      bool `json:"executor"`
+			ManagementAPI bool `json:"management_api"`
 			ModelProvider bool `json:"model_provider"`
 		} `json:"capabilities"`
 	}
 	if errDecode := json.Unmarshal(result, &registration); errDecode != nil {
 		t.Fatalf("decode registration: %v", errDecode)
 	}
-	if registration.SchemaVersion != 1 || registration.Metadata.Version != pluginVersion || !registration.Capabilities.Executor || !registration.Capabilities.ModelProvider {
+	if registration.SchemaVersion != 1 ||
+		registration.Metadata.Version != pluginVersion ||
+		!registration.Capabilities.AuthProvider ||
+		!registration.Capabilities.Executor ||
+		!registration.Capabilities.ManagementAPI ||
+		!registration.Capabilities.ModelProvider {
 		t.Fatalf("unexpected registration: %+v", registration)
+	}
+}
+
+func TestModelsForAuthAlwaysReturnsStaticCatalogue(t *testing.T) {
+	result, errorCode, errorMessage := handleMethod("model.for_auth", []byte(`{"StorageJSON":"invalid"}`))
+	if errorCode != "" || errorMessage != "" {
+		t.Fatalf("model.for_auth failed: code=%q message=%q", errorCode, errorMessage)
+	}
+	var response struct {
+		Provider string `json:"Provider"`
+		Models   []struct {
+			ID string `json:"ID"`
+		} `json:"Models"`
+	}
+	if errDecode := json.Unmarshal(result, &response); errDecode != nil {
+		t.Fatalf("decode model.for_auth response: %v", errDecode)
+	}
+	if response.Provider != providerKey || len(response.Models) != len(codeiumModels) {
+		t.Fatalf("unexpected model.for_auth response: %+v", response)
+	}
+}
+
+func TestOpenAIStreamChunkLeavesSSEFramingToHost(t *testing.T) {
+	chunk := openAIStreamChunk("chatcmpl-test", "swe-1-7", "assistant", "STREAM_OK", "", "")
+	if strings.HasPrefix(string(chunk), "data:") {
+		t.Fatalf("executor chunk unexpectedly contains SSE framing: %q", chunk)
+	}
+	if !json.Valid(chunk) {
+		t.Fatalf("executor chunk is not valid JSON: %q", chunk)
 	}
 }
 

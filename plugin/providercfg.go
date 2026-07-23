@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"runtime"
 	"strings"
 )
@@ -60,25 +61,55 @@ func mapAttrOr(attrs map[string]string, meta map[string]any, key, def string) st
 
 // configFromMaps builds a providerConfig from host auth attributes + metadata.
 func configFromMaps(attrs map[string]string, meta map[string]any) providerConfig {
-	session := mapAttr(attrs, meta, "session_token")
+	return configFromAuthData(nil, attrs, meta)
+}
+
+// configFromAuthData combines provider-owned persisted credentials with host
+// metadata and explicit attributes. Attributes remain the highest-priority
+// source so administrators can override non-secret defaults when necessary.
+func configFromAuthData(storageJSON []byte, attrs map[string]string, meta map[string]any) providerConfig {
+	storageMetadata := make(map[string]any)
+	if len(storageJSON) > 0 {
+		_ = json.Unmarshal(storageJSON, &storageMetadata)
+	}
+	mergedMetadata := make(map[string]any, len(storageMetadata)+len(meta))
+	for key, value := range storageMetadata {
+		mergedMetadata[key] = value
+	}
+	for key, value := range meta {
+		mergedMetadata[key] = value
+	}
+
+	// Older manually imported files sometimes nested their credential values
+	// under "attributes". Accept that shape without allowing it to override
+	// top-level metadata or explicit runtime attributes.
+	if legacyAttributes, ok := mergedMetadata["attributes"].(map[string]any); ok {
+		for key, value := range legacyAttributes {
+			if _, alreadyDefined := mergedMetadata[key]; !alreadyDefined {
+				mergedMetadata[key] = value
+			}
+		}
+	}
+
+	session := mapAttr(attrs, mergedMetadata, "session_token")
 	id := deviceFingerprint(session)
 	return providerConfig{
-		endpoint:     mapAttrOr(attrs, meta, "endpoint", defaultEndpoint),
-		clientName:   mapAttrOr(attrs, meta, "client_name", "windsurf"),
-		extVersion:   mapAttrOr(attrs, meta, "ext_version", "1.48.2"),
-		ideVersion:   mapAttrOr(attrs, meta, "ide_version", "3.3.18"),
-		locale:       mapAttrOr(attrs, meta, "locale", "en"),
+		endpoint:     mapAttrOr(attrs, mergedMetadata, "endpoint", defaultEndpoint),
+		clientName:   mapAttrOr(attrs, mergedMetadata, "client_name", "windsurf"),
+		extVersion:   mapAttrOr(attrs, mergedMetadata, "ext_version", "1.48.2"),
+		ideVersion:   mapAttrOr(attrs, mergedMetadata, "ide_version", "3.3.18"),
+		locale:       mapAttrOr(attrs, mergedMetadata, "locale", "en"),
 		sessionToken: session,
-		teamID:       mapAttr(attrs, meta, "team_id"),
-		userID:       mapAttr(attrs, meta, "user_id"),
-		systemPrompt: mapAttrOr(attrs, meta, "system_prompt", defaultSystemPrompt),
-		osJSON:       mapAttrOr(attrs, meta, "os_json", osJSON()),
-		cpuJSON:      mapAttrOr(attrs, meta, "cpu_json", cpuJSON()),
-		deviceID:     mapAttrOr(attrs, meta, "device_id", id.DeviceID),
-		extPath:      mapAttrOr(attrs, meta, "ext_path", defaultExtPath()),
-		hwHash:       mapAttrOr(attrs, meta, "hw_hash", id.HWHash),
-		hash27:       mapAttrOr(attrs, meta, "hash27", id.Hash27),
-		hex31:        mapAttr(attrs, meta, "hex31"),
+		teamID:       mapAttr(attrs, mergedMetadata, "team_id"),
+		userID:       mapAttr(attrs, mergedMetadata, "user_id"),
+		systemPrompt: mapAttrOr(attrs, mergedMetadata, "system_prompt", defaultSystemPrompt),
+		osJSON:       mapAttrOr(attrs, mergedMetadata, "os_json", osJSON()),
+		cpuJSON:      mapAttrOr(attrs, mergedMetadata, "cpu_json", cpuJSON()),
+		deviceID:     mapAttrOr(attrs, mergedMetadata, "device_id", id.DeviceID),
+		extPath:      mapAttrOr(attrs, mergedMetadata, "ext_path", defaultExtPath()),
+		hwHash:       mapAttrOr(attrs, mergedMetadata, "hw_hash", id.HWHash),
+		hash27:       mapAttrOr(attrs, mergedMetadata, "hash27", id.Hash27),
+		hex31:        mapAttr(attrs, mergedMetadata, "hex31"),
 	}
 }
 
